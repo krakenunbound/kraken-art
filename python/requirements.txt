@@ -1,0 +1,45 @@
+# Torch with CUDA installed separately. On Windows / Linux with NVIDIA:
+#   pip install torch==2.6.0+cu124 torchvision --index-url https://download.pytorch.org/whl/cu124
+# (or matching cu125/cu128 if you want a newer toolkit).
+# torch>=2.6
+# torchvision
+
+# Diffusion stack
+diffusers>=0.32
+# transformers 5.x refactored CLIPTextModel.text_model away; diffusers 0.38's
+# single_file loader still expects the 4.x layout. Pin until diffusers catches up.
+transformers>=4.46,<5
+accelerate>=1.2
+safetensors>=0.4
+sentencepiece
+protobuf
+# FP8 dequant fallback when the GPU cast path isn't available.
+ml_dtypes>=0.5
+einops>=0.8
+
+# Image / upscale
+Pillow>=10
+numpy>=1.26
+# Universal upscaler loader (Real-ESRGAN, SwinIR, DAT, OmniSR, …).
+spandrel>=0.4
+
+# API
+fastapi>=0.115
+uvicorn[standard]>=0.32
+websockets>=13
+pydantic>=2.9
+python-dotenv
+
+# GPU detection / system
+psutil
+pynvml
+nvidia-ml-py
+
+# Logging
+structlog>=24.4
+
+# Optional, Windows only — enables `performance.flux_compile=on` (torch.compile path).
+# Default PyTorch on Windows ships without Triton. Pair version with your torch:
+#   torch 2.6 → triton-windows>=3.2,<3.3
+#   torch 2.7 → triton-windows>=3.3,<3.4
+# triton-windows>=3.2,<3.3 ; sys_platform == 'win32'

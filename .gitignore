@@ -1,0 +1,64 @@
+# =============================================================================
+# Kraken Art .gitignore
+# =============================================================================
+# Repo holds source only. Models, generated outputs, build artifacts, and the
+# Python venv stay LOCAL — they're either huge, user-private, or trivially
+# reproducible.
+
+# ---- Large local data (NEVER commit) ----------------------------------------
+# Diffusion checkpoints, LoRAs, VAE files, text encoders, upscalers — typically
+# 100s of GB. Users bring their own; we don't ship them.
+models/
+# Per-gen outputs (PNG/MP4). User-private. Reproducible from prompt+seed.
+outputs/
+# Local dequant cache (e.g. T5 bf16 cache file). Rebuilt on first load.
+_kraken_cache/
+
+# ---- Build artifacts / dependencies -----------------------------------------
+node_modules/
+dist/
+dist-ssr/
+# Rust target dir (cargo build cache, ~3 GB).
+src-tauri/target/
+# Tauri's generated tray icon / IDE files.
+src-tauri/gen/schemas/
+# Python venv (~5 GB, reproducible from requirements.txt).
+python/venv/
+python/__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# Bytecode-style files PyInstaller would produce if we ever bundle.
+*.spec
+build/
+
+# ---- User-local state (NEVER commit) ----------------------------------------
+# User settings include the Civitai API token field. Even if blank, keep
+# everything under config/ local.
+config/
+# Convenience scratch from the launcher / smoke tests.
+.last_job_id.txt
+python/sidecar.out
+python/sidecar.err
+
+# ---- Logs -------------------------------------------------------------------
+logs/
+*.log
+model-copy.log
+
+# ---- Editor / OS noise ------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.local
+
+# ---- Anthropic / Claude Code workspace --------------------------------------
+.claude/
