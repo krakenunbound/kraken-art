@@ -1,20 +1,31 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  addSongsToPlaylist,
   audioGenerate,
   audioHealth,
   bulkDeleteSongs,
   cancelAudioJob,
+  createPlaylist,
+  createWorkspace,
   deleteSong as deleteSongApi,
   getAudioJob,
+  getPlaylists,
   getSongLibrary,
   type AudioHealth,
   type ModelListing,
+  type Playlist,
   type Song,
   type SongStudioHealth,
   type SongStudioModel,
   songStreamUrl,
   songStudioHealth,
 } from "./api/sidecar";
+
+// Filter that's currently active in the left sidebar. `null` = show everything.
+type LibraryFilter =
+  | { type: "workspace"; workspaceId: string; workspaceTitle: string }
+  | { type: "playlist"; playlistId: string; playlistTitle: string }
+  | null;
 
 interface MusicProps {
   models: ModelListing | null;
@@ -60,6 +71,13 @@ export default function Music({ models, sidecar }: MusicProps) {
   const [activeSong, setActiveSong] = useState<Song | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
 
+  // ---- Sidebar state (B2) --------------------------------------------------
+  const [playlists, setPlaylists] = useState<Playlist[]>([]);
+  const [activeFilter, setActiveFilter] = useState<LibraryFilter>(null);
+  const [newPlaylistName, setNewPlaylistName] = useState("");
+  const [creatingPlaylist, setCreatingPlaylist] = useState(false);
+  const [addToPlaylistOpen, setAddToPlaylistOpen] = useState(false);
+
   // ---- Song Studio health + model catalog ----------------------------------
   const [ssHealth, setSsHealth] = useState<SongStudioHealth | null>(null);
   const [ssModels, setSsModels] = useState<SongStudioModel[]>([]);
@@ -100,10 +118,22 @@ export default function Music({ models, sidecar }: MusicProps) {
     }
   }, [sidecar]);
 
+  const reloadPlaylists = useCallback(async () => {
+    if (sidecar !== "up") return;
+    try {
+      const data = await getPlaylists();
+      setPlaylists(Array.isArray(data.playlists) ? data.playlists : []);
+    } catch (e) {
+      // Non-fatal — sidebar just shows empty playlists section.
+      setPlaylists([]);
+    }
+  }, [sidecar]);
+
   // Initial load + Song Studio health probe ----------------------------------
   useEffect(() => {
     if (sidecar !== "up") return;
     reloadLibrary();
+    reloadPlaylists();
     (async () => {
       try {
         const h = await songStudioHealth();
@@ -136,17 +166,52 @@ export default function Music({ models, sidecar }: MusicProps) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [library, search]);
 
-  // ---- Filtered library (search) -------------------------------------------
+  // ---- Workspaces derived from library (B2) --------------------------------
+  // Song Studio doesn't expose a GET /workspaces — songs are the source of
+  // truth, each carrying workspaceId + workspaceTitle. We derive distinct
+  // entries here so the sidebar lists every workspace the user actually has
+  // songs in.
+  const workspaces = useMemo(() => {
+    const seen = new Map<string, { id: string; title: string; count: number }>();
+    for (const s of library) {
+      const id = s.workspaceId || "";
+      const title = s.workspaceTitle || "(no workspace)";
+      const key = id || title;
+      const entry = seen.get(key);
+      if (entry) entry.count++;
+      else seen.set(key, { id: id || title, title, count: 1 });
+    }
+    return Array.from(seen.values()).sort((a, b) => a.title.localeCompare(b.title));
+  }, [library]);
+
+  // ---- Filtered library (search + sidebar filter) --------------------------
   const filtered = useMemo(() => {
-    if (!search.trim()) return library;
-    const q = search.trim().toLowerCase();
-    return library.filter(s =>
-      (s.title || "").toLowerCase().includes(q) ||
-      (s.workspaceTitle || "").toLowerCase().includes(q) ||
-      (s.summary || "").toLowerCase().includes(q) ||
-      (s.prompt || "").toLowerCase().includes(q)
-    );
-  }, [library, search]);
+    let xs = library;
+
+    // Apply sidebar filter first.
+    if (activeFilter?.type === "workspace") {
+      xs = xs.filter(s =>
+        (s.workspaceId && s.workspaceId === activeFilter.workspaceId) ||
+        s.workspaceTitle === activeFilter.workspaceTitle
+      );
+    } else if (activeFilter?.type === "playlist") {
+      const playlist = playlists.find(p => p.id === activeFilter.playlistId);
+      const ids = new Set(playlist?.songIds || playlist?.songs?.map(s => s.id) || []);
+      xs = xs.filter(s => ids.has(s.id));
+    }
+
+    // Then search.
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      xs = xs.filter(s =>
+        (s.title || "").toLowerCase().includes(q) ||
+        (s.workspaceTitle || "").toLowerCase().includes(q) ||
+        (s.summary || "").toLowerCase().includes(q) ||
+        (s.prompt || "").toLowerCase().includes(q)
+      );
+    }
+    return xs;
+  }, [library, search, activeFilter, playlists]);
 
   // ---- Bulk actions --------------------------------------------------------
   async function onBulkDelete() {
@@ -166,6 +231,54 @@ export default function Music({ models, sidecar }: MusicProps) {
       window.alert(`Bulk delete failed: ${e?.message ?? e}`);
     } finally {
       setBulkBusy(false);
+    }
+  }
+
+  async function onCreatePlaylist() {
+    const name = newPlaylistName.trim();
+    if (!name) return;
+    setCreatingPlaylist(true);
+    try {
+      await createPlaylist(name);
+      setNewPlaylistName("");
+      await reloadPlaylists();
+    } catch (e: any) {
+      window.alert(`Create playlist failed: ${e?.message ?? e}`);
+    } finally {
+      setCreatingPlaylist(false);
+    }
+  }
+
+  async function onAddSelectedToPlaylist(playlistId: string, playlistTitle: string) {
+    if (selectedIds.size === 0) return;
+    const ids = Array.from(selectedIds);
+    try {
+      await addSongsToPlaylist(playlistId, ids);
+      setAddToPlaylistOpen(false);
+      // Reload playlists so the in-memory songIds reflect the new state for
+      // the playlist filter to work immediately.
+      await reloadPlaylists();
+      // Friendly confirmation in the toolbar status spot — UX nicety; could
+      // be a toast in a future iteration.
+      window.alert(`Added ${ids.length} song${ids.length === 1 ? "" : "s"} to "${playlistTitle}".`);
+    } catch (e: any) {
+      window.alert(`Add to playlist failed: ${e?.message ?? e}`);
+    }
+  }
+
+  async function onCreateWorkspace() {
+    const name = window.prompt("New workspace name:");
+    if (!name?.trim()) return;
+    try {
+      await createWorkspace(name.trim());
+      // Workspaces are derived from library — new empty workspace won't show
+      // until a song is generated into it. Tell the user.
+      window.alert(
+        `Workspace "${name.trim()}" created. It will appear in this sidebar once a song is generated into it ` +
+        `(Song Studio derives workspace lists from songs).`
+      );
+    } catch (e: any) {
+      window.alert(`Create workspace failed: ${e?.message ?? e}`);
     }
   }
 
@@ -276,16 +389,115 @@ export default function Music({ models, sidecar }: MusicProps) {
 
   return (
     <>
+      {/* Left pane — workspaces + playlists sidebar (B2) ------------------- */}
+      <aside className="pane left-system music-sidebar">
+        <div className="music-sidebar-section">
+          <div className="music-sidebar-header">
+            <span>Library</span>
+          </div>
+          <button
+            className={"music-filter-button" + (!activeFilter ? " active" : "")}
+            onClick={() => setActiveFilter(null)}
+          >
+            All songs
+            <span className="music-filter-count">{library.length}</span>
+          </button>
+        </div>
+
+        <div className="music-sidebar-section">
+          <div className="music-sidebar-header">
+            <span>Workspaces</span>
+            <button
+              className="music-sidebar-add"
+              onClick={onCreateWorkspace}
+              title="Create a new workspace (it appears here once a song is in it)"
+            >+</button>
+          </div>
+          {workspaces.length === 0 ? (
+            <div className="muted small" style={{ padding: "4px 8px" }}>No songs yet.</div>
+          ) : (
+            workspaces.map((w) => {
+              const isActive = activeFilter?.type === "workspace" && activeFilter.workspaceTitle === w.title;
+              return (
+                <button
+                  key={w.id}
+                  className={"music-filter-button" + (isActive ? " active" : "")}
+                  onClick={() => setActiveFilter({ type: "workspace", workspaceId: w.id, workspaceTitle: w.title })}
+                  title={w.title}
+                >
+                  <span className="music-filter-label">{w.title}</span>
+                  <span className="music-filter-count">{w.count}</span>
+                </button>
+              );
+            })
+          )}
+        </div>
+
+        <div className="music-sidebar-section">
+          <div className="music-sidebar-header">
+            <span>Playlists</span>
+            <button onClick={reloadPlaylists} className="music-sidebar-add" title="Refresh">⟳</button>
+          </div>
+          {playlists.length === 0 ? (
+            <div className="muted small" style={{ padding: "4px 8px" }}>None yet.</div>
+          ) : (
+            playlists.map((p) => {
+              const isActive = activeFilter?.type === "playlist" && activeFilter.playlistId === p.id;
+              const count = p.songIds?.length ?? p.songs?.length ?? 0;
+              return (
+                <button
+                  key={p.id}
+                  className={"music-filter-button" + (isActive ? " active" : "")}
+                  onClick={() => setActiveFilter({ type: "playlist", playlistId: p.id, playlistTitle: p.title })}
+                  title={p.title}
+                >
+                  <span className="music-filter-label">{p.title}</span>
+                  <span className="music-filter-count">{count}</span>
+                </button>
+              );
+            })
+          )}
+          <div className="new-playlist-form">
+            <input
+              type="text"
+              placeholder="New playlist name..."
+              value={newPlaylistName}
+              onChange={(e) => setNewPlaylistName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") onCreatePlaylist(); }}
+              disabled={creatingPlaylist}
+            />
+            <button
+              onClick={onCreatePlaylist}
+              disabled={creatingPlaylist || !newPlaylistName.trim()}
+            >
+              {creatingPlaylist ? "..." : "Add"}
+            </button>
+          </div>
+        </div>
+      </aside>
+
       {/* Center pane — Suno-style library grid + toolbar ------------------- */}
       <main className="pane center gen-center music-center">
         <div className="music-toolbar">
           <div className="music-toolbar-title">
             <span style={{ fontSize: 22 }}>♪</span>
-            <strong>Music Library</strong>
+            <strong>
+              {activeFilter?.type === "workspace" && activeFilter.workspaceTitle}
+              {activeFilter?.type === "playlist" && activeFilter.playlistTitle}
+              {!activeFilter && "All songs"}
+            </strong>
             <span className="muted small" style={{ marginLeft: 6 }}>
-              {libraryLoading ? "loading..." : `${library.length} song${library.length === 1 ? "" : "s"}`}
-              {search && library.length !== filtered.length && ` · ${filtered.length} match`}
+              {libraryLoading
+                ? "loading..."
+                : `${filtered.length}${filtered.length !== library.length ? ` of ${library.length}` : ""} song${filtered.length === 1 ? "" : "s"}`}
             </span>
+            {activeFilter && (
+              <button
+                className="filter-clear"
+                onClick={() => setActiveFilter(null)}
+                title="Clear sidebar filter"
+              >×</button>
+            )}
           </div>
           <input
             className="music-search"
@@ -298,6 +510,28 @@ export default function Music({ models, sidecar }: MusicProps) {
             {selectedIds.size > 0 ? (
               <>
                 <span className="muted small">{selectedIds.size} selected</span>
+                <div className="add-to-playlist-wrap">
+                  <button
+                    onClick={() => setAddToPlaylistOpen(o => !o)}
+                    disabled={playlists.length === 0}
+                    title={playlists.length === 0 ? "Create a playlist first (left sidebar)" : "Add selected to a playlist"}
+                  >
+                    Add to playlist ▾
+                  </button>
+                  {addToPlaylistOpen && playlists.length > 0 && (
+                    <div className="add-to-playlist-menu">
+                      {playlists.map((p) => (
+                        <button
+                          key={p.id}
+                          className="add-to-playlist-item"
+                          onClick={() => onAddSelectedToPlaylist(p.id, p.title)}
+                        >
+                          {p.title}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
                 <button onClick={onBulkDelete} disabled={bulkBusy} className="danger">
                   {bulkBusy ? "Deleting..." : "Delete"}
                 </button>

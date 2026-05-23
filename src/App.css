@@ -968,3 +968,175 @@ button.big { padding: 9px 22px; font-size: 14px; letter-spacing: 0.04em; }
   border-radius: 4px;
   border: 1px solid rgba(255, 255, 255, 0.05);
 }
+
+/* =============================================================================
+   Music tab — sidebar (Phase B2, 2026-05-23)
+   ========================================================================== */
+
+.music-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 12px 10px;
+  overflow-y: auto;
+}
+.music-sidebar-section {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.music-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted, #8a93a3);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  margin-bottom: 4px;
+}
+.music-sidebar-add {
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--muted, #8a93a3);
+  font-size: 13px;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.music-sidebar-add:hover {
+  background: rgba(0, 229, 255, 0.1);
+  border-color: rgba(0, 229, 255, 0.4);
+  color: var(--accent, #00e5ff);
+}
+
+.music-filter-button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  background: none;
+  border: none;
+  color: var(--fg, #e8e8e8);
+  text-align: left;
+  padding: 5px 8px;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  width: 100%;
+}
+.music-filter-button:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.music-filter-button.active {
+  background: rgba(0, 229, 255, 0.14);
+  color: var(--accent, #00e5ff);
+}
+.music-filter-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.music-filter-count {
+  font-size: 10px;
+  color: var(--muted, #8a93a3);
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 6px;
+  border-radius: 8px;
+  min-width: 16px;
+  text-align: center;
+}
+.music-filter-button.active .music-filter-count {
+  color: var(--accent, #00e5ff);
+  background: rgba(0, 229, 255, 0.18);
+}
+
+.new-playlist-form {
+  display: flex;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 0 8px;
+}
+.new-playlist-form input {
+  flex: 1;
+  font-size: 12px;
+  padding: 4px 6px;
+  background: #11161f;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  color: var(--fg, #e8e8e8);
+  min-width: 0;
+}
+.new-playlist-form input:focus {
+  outline: none;
+  border-color: var(--accent, #00e5ff);
+}
+.new-playlist-form button {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+.filter-clear {
+  margin-left: 4px;
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--muted, #8a93a3);
+  font-size: 12px;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.filter-clear:hover {
+  background: rgba(185, 67, 67, 0.15);
+  border-color: rgba(185, 67, 67, 0.5);
+  color: #ff8a8a;
+}
+
+.add-to-playlist-wrap {
+  position: relative;
+  display: inline-block;
+}
+.add-to-playlist-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  min-width: 180px;
+  max-height: 260px;
+  overflow-y: auto;
+  background: #11161f;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.add-to-playlist-item {
+  background: none;
+  border: none;
+  color: var(--fg, #e8e8e8);
+  font-size: 12px;
+  padding: 6px 10px;
+  text-align: left;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.add-to-playlist-item:hover {
+  background: rgba(0, 229, 255, 0.14);
+  color: var(--accent, #00e5ff);
+}

@@ -508,4 +508,54 @@ CHANGELOG.md will get one summary entry at the end of Phase B (after B3 lands), 
 - Cover image proxy may need its own endpoint if `/api/audio/stream` mistypes the Content-Type for JPEGs. Visual confirmation in-app will tell us.
 - ComfyUI cover replacement — Phase C.
 
-**Commit / tag (filled in when this lands):** see Section 13.3 below.
+**Commit:** `2678a5c` on `feature/audio-integration`.
+**Tag:** `checkpoint/2026-05-23-1925-phase-b1-library-grid` (pushed).
+
+### 13.3 — B2 in progress: workspace + playlist sidebar (2026-05-23 19:31 UTC)
+
+**Pre-work setup:**
+- Filesystem backup: `backups/2026-05-23-1859-pre-phase-b2-sidebar/` (Music.tsx + App.css)
+- Pre-work tag: `checkpoint/2026-05-23-1859-pre-phase-b2-sidebar` (pushed)
+- Branch state going in: at `2678a5c` (B1 complete)
+
+**Scope of B2:**
+- Add a `<aside className="pane left-system">` BEFORE the existing center pane (Music tab will have three panes total, matching Generate's pattern).
+- Left pane content:
+  - Workspaces section: list of unique `workspaceTitle` strings derived from the library; clicking one filters the grid (a "workspace tag" filter rather than an active selection — Song Studio uses workspaces as a tagging system, songs always have one).
+  - Playlists section: loads from `/api/audio/playlists`; "New playlist" inline form; clicking a playlist filters the grid to that playlist's songs.
+  - Workspace creation button: prompts for a name, POSTs `/api/audio/workspaces`, refreshes the list.
+- Center toolbar gains an "Add to playlist" action when selection is non-empty. Modal/dropdown to pick a target playlist.
+- Library reload picks up new workspace/playlist memberships.
+
+**Notes/discoveries:**
+- Workspaces are NOT a GET-able list in Song Studio (only POST/PATCH). Enumeration is implicit: derive distinct `workspaceTitle` values from the loaded library array. This matches what Song Studio's own UI does (the workspace pills in the screenshot are derived, not fetched).
+
+### 13.4 — B2 landed: workspace + playlist sidebar (2026-05-23 19:50 UTC)
+
+**Files modified:**
+- `src/Music.tsx`:
+  - New types: `LibraryFilter` (union of workspace/playlist).
+  - New state: `playlists`, `activeFilter`, `newPlaylistName`, `creatingPlaylist`, `addToPlaylistOpen`.
+  - New loader: `reloadPlaylists()` — fetches `/api/audio/playlists`, fails silently to empty list.
+  - New derived value: `workspaces` (distinct from library — Song Studio doesn't expose GET /workspaces, so we derive from the songs themselves).
+  - Filter logic in `filtered` now applies sidebar filter first, then search.
+  - New handlers: `onCreatePlaylist`, `onAddSelectedToPlaylist`, `onCreateWorkspace`.
+  - New JSX: `<aside className="pane left-system music-sidebar">` BEFORE the center pane. Three sections: Library (All songs), Workspaces (derived list with counts + create button + warning that empty workspaces don't appear until a song lives in them), Playlists (live list + inline "New playlist" form + Refresh button).
+  - Toolbar title now reflects the active filter ("Codex gqom · 47 songs" instead of "All songs"); × button next to it clears the filter.
+  - Toolbar selection actions gained "Add to playlist ▾" dropdown when songs are selected and at least one playlist exists.
+- `src/App.css` — appended sidebar styles: `.music-sidebar`, `.music-sidebar-section`, `.music-sidebar-header`, `.music-sidebar-add`, `.music-filter-button` (+ `:hover`, `.active`), `.music-filter-label`, `.music-filter-count`, `.new-playlist-form`, `.filter-clear`, `.add-to-playlist-wrap`, `.add-to-playlist-menu`, `.add-to-playlist-item`. No existing rules modified.
+- `Documentation/Cursor-audio-adaption.md` — this section (13.4).
+
+**What works now (cumulative with B1):**
+- Left sidebar appears with three sections matching the screenshot's workspace pills.
+- "All songs" is the default; clicking any workspace pill filters the grid to that workspace's songs (with the workspace's title appearing in the center toolbar).
+- "+" next to Workspaces creates a workspace via the API (with the documented "won't appear until a song is in it" caveat in a confirm dialog).
+- Playlists list loads from the API; "New playlist" inline form below it creates one; ⟳ refreshes.
+- Click a playlist → grid filters to that playlist's songs.
+- × button next to the filter title clears back to "All songs".
+- When N songs selected → "Add to playlist ▾" dropdown shows existing playlists; clicking one POSTs to `/api/audio/playlists/{id}/songs` and refreshes the playlist's membership.
+
+**Intentionally deferred to B3:** persistent bottom player bar. Right now the inline player at the bottom of the center pane still does the job for playback.
+
+**Commit:** `<filled in below after commit>` on `feature/audio-integration`.
+**Tag:** `<filled in below after tag>`
