@@ -615,8 +615,9 @@ What works now:
 TypeScript: `npx tsc --noEmit` clean for new code (two pre-existing
 TS6133 unused-var warnings in `src/App.tsx` left as-is per branch policy).
 
-Commit: <pending — filled in next>
-Post-work tag: `checkpoint/2026-05-23-1910-phase-b3-player-bar`
+Commit: `20c0d61` on `feature/audio-integration`, pushed to GitHub.
+Post-work tag: `checkpoint/2026-05-23-1910-phase-b3-player-bar` (pushed)
+Post-work backup: `backups/2026-05-23-1910-post-phase-b3-player-bar/`
 
 ### 13.6 — Phase B summary (2026-05-23 19:10 UTC)
 
