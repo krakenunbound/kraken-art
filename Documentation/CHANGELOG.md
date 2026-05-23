@@ -2,6 +2,49 @@
 
 Session-by-session record of what's landed.
 
+## 2026-05-23 (afternoon) — Audio integration: Song Studio (port 8010) proxy
+
+**Commit:** `17b9fc1` on `feature/audio-integration`, pushed to GitHub.
+**Checkpoint tag:** `checkpoint/2026-05-23-phase-a-song-studio-proxy`.
+
+Cursor's earlier 2026-05-23 work (sections 7-11 of `Cursor-audio-adaption.md`)
+bridged the bare ACE-Step API on port 8001 — raw "submit a job, get a .wav."
+This commit completes that by also wiring Kraken_Audio's **Codex Song Studio**
+on port 8010 (the actual user-facing workstation the user demonstrated with the
+Audio Studio screenshots).
+
+The user-facing payoff: **all 364 of the existing library songs** now show up
+through Kraken Art's port 7780 — the Music tab UI never has to know that
+8001 (raw ACE) and 8010 (workstation) even exist.
+
+The Phase A endpoints landing in this commit:
+
+| Method | Route | Forwards to |
+|---|---|---|
+| GET | `/api/audio/song-studio/health` | 8010 `/api/config` (catalog + service health) |
+| GET | `/api/audio/library` | 8010 `/api/library` (all songs incl. metadata) |
+| GET | `/api/audio/playlists` | 8010 `/api/playlists` |
+| POST | `/api/audio/playlists` | 8010 `/api/playlists` |
+| POST | `/api/audio/playlists/{id}/songs` | 8010 same |
+| POST/PATCH | `/api/audio/workspaces[/{id}]` | 8010 same |
+| DELETE | `/api/audio/songs/{id}` | 8010 `/api/library/songs/{id}` |
+| POST | `/api/audio/songs/bulk-delete` | 8010 same |
+| GET | `/api/audio/stream?path=...` | 8010 `/api/audio?path=...` (audio playback) |
+| GET | `/api/audio/songs/{id}/download` | 8010 same (MP3 + Content-Disposition) |
+
+Plus the Cursor-built Music tab + bare ACE bridge (sections 7-11) — those
+moved from disk into git here as part of one cohesive "audio integration"
+commit. Phase B (Suno-style library UI) and Phase C (cover-art redirect to
+internal FLUX/SDXL) are the next two commits — see tasks #54 and #55.
+
+**Out of scope, intentionally left uncommitted on this branch:**
+- FLUX-speed experiments (`streaming_linear.py`, `kraken_flux_attn.py`,
+  `kraken_rope.py`, `kraken_fbcache.py`, all `*.bak` files, bench scripts,
+  `Documentation/FLUX-PERFORMANCE-EXPERIMENTS.md`, `gemini.md`,
+  `Documentation/FLUX-SPEED-{WIP,RESEARCH}.md` updates).
+- These will land in a separate FLUX-speed commit after the audio work
+  reaches Phase D. Listed in section 12 of `Cursor-audio-adaption.md`.
+
 ## 2026-05-21 (evening) — FLUX speed pass: StreamingLinear offload
 
 The goal was ComfyUI-parity throughput for FLUX-dev on a 24 GB GPU. The diffusers

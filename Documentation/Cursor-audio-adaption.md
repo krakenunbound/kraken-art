@@ -386,3 +386,65 @@ Ready when you are.
 The documentation in this file + the code on branch `feature/audio-integration` (with the pre-adaptation backup tag `backup/2026-05-23-0856-pre-audio-adaptation`) constitute the complete record of the work.
 
 User can now launch, Refresh models, Check ACE service, and Generate with the proper layout. Bug reports and iteration requests are expected next.
+
+---
+
+## 12. Phase A (Claude) — Song Studio (port 8010) proxy wired (2026-05-23 afternoon UTC-7)
+
+**Author:** Claude (continued session — different agent from Cursor sections 7-11).
+
+**Context:** Cursor's audio integration (sections 7-11) only bridged the bare ACE-Step API on port 8001 — that's raw "submit job, get .wav back." It did NOT wire the Codex Song Studio API on port 8010, which is the actual workstation (persistent library, workspaces, playlists, song metadata, MP3 download with embedded cover, lyric sync). User reported their full Audio Studio (port 8010) had 364 songs in a Suno-style library and asked that all of that show up inside Kraken Art.
+
+**What landed (commit `17b9fc1` on `feature/audio-integration`, pushed to GitHub):**
+
+| File | Change |
+|---|---|
+| `python/pipelines/audio/song_studio_client.py` | NEW. Thin httpx wrapper around port 8010. Env override `KRAKEN_SONG_STUDIO_URL`. |
+| `python/api/audio.py` | Added Song Studio proxy routes — see endpoint list below. |
+| (no other file modified) | The bare ACE-Step proxy (port 8001) from sections 7-11 still works untouched. |
+
+**New proxy endpoints (all under `/api/audio/` on Kraken Art's port 7780):**
+
+| Method | Route | Forwards to | Status |
+|---|---|---|---|
+| GET | `/song-studio/health` | 8010 `/api/config` (catalog + service health) | verified — 4 models, coverArtStatus |
+| GET | `/library` | 8010 `/api/library` | verified — **364 songs** |
+| GET | `/playlists` | 8010 `/api/playlists` | verified — empty as expected |
+| POST | `/playlists` | 8010 `/api/playlists` | wired |
+| POST | `/playlists/{id}/songs` | 8010 `/api/playlists/{id}/songs` | wired |
+| POST | `/workspaces` | 8010 `/api/workspaces` | wired |
+| PATCH | `/workspaces/{id}` | 8010 `/api/workspaces/{id}` | wired |
+| DELETE | `/songs/{id}` | 8010 `/api/library/songs/{id}` | wired |
+| POST | `/songs/bulk-delete` | 8010 `/api/library/songs/bulk-delete` | wired |
+| GET | `/stream?path=...` | 8010 `/api/audio?path=...` (for `<audio src>` playback) | wired |
+| GET | `/songs/{id}/download` | 8010 `/api/library/songs/{id}/download` (MP3 + Content-Disposition) | wired |
+
+**Intentional non-route:** there is no `GET /songs/{id}` — Song Studio doesn't ship a per-song GET; only the whole library. The React UI loads the library once and looks up by id from its cached array.
+
+**Verified end-to-end:**
+- Sample songs returned: Salt And Dust [Codex gqom], Hold The Gate [Codex gqom], Slow Flash [Codex gqom] — same as the user's Audio Studio screenshots.
+- Model catalog returned with all 4 entries the user showed in the dropdown screenshot: ACE-Step 1.5 Turbo + Stable Audio 3 Medium/Small Music/Small SFX.
+- `coverArtStatus = "ComfyUI offline"` is confirmed — that's the symptom Phase C will fix.
+
+**Why this matters for the user's vision:** Kraken Art's Music tab can now read everything Song Studio knows about without ever directly touching port 8010 from the frontend. The webview only talks to 7780. The transformers-version conflict that forces multiple processes is now fully hidden from the UI.
+
+**Out of scope for this commit (next phases):**
+- Phase B (#54): Suno-style Music tab UI — workspace+playlist sidebar, song grid with cover thumbs + checkboxes, persistent player bar.
+- Phase C (#55): cover-art redirect — replace Song Studio's ComfyUI call with Kraken Art's internal FLUX/SDXL.
+- Phase D (#56): verify MP3 export has 320 kbps + ID3 cover embed; add fallback in our proxy if not.
+
+**Git audit trail at end of this section:**
+- Branch: `feature/audio-integration`
+- Latest commit: `17b9fc1` — "Audio integration: Music tab + Song Studio proxy + ACE bridge"
+- Latest pushed: yes (`origin/feature/audio-integration`)
+- Backup tag still valid: `backup/2026-05-23-0856-pre-audio-adaptation` (pre-Cursor's work)
+- New tag added at end of Phase A: `checkpoint/2026-05-23-phase-a-song-studio-proxy` (so we can diff vs this exact point later)
+
+**Working-copy artifacts NOT committed (deliberately, but logged for transparency):**
+- `python/pipelines/flux.py.bak`, `python/pipelines/kraken_flux_attn.py.bak`, `python/pipelines/streaming_linear.py.bak` — Cursor's iteration backups from FLUX-speed work.
+- `python/bench_clean.sh`, `python/bench_step_ws.py`, `python/bench_comfyui.py` — bench harnesses from FLUX-speed work.
+- `python/pipelines/kraken_rope.py`, `python/pipelines/kraken_fbcache.py` — disabled FLUX-speed experiments preserved for reference.
+- `gemini.md`, `Documentation/FLUX-PERFORMANCE-EXPERIMENTS.md` — FLUX-speed reports.
+- All FLUX-speed in-tree edits to `flux.py`, `streaming_linear.py`, `kraken_flux_attn.py`.
+
+These will be committed (or formally discarded) in a separate FLUX-speed commit. They are NOT lost — they're on disk under `feature/audio-integration` and the next commit will sort them out.
