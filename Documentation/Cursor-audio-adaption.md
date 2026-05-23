@@ -448,3 +448,64 @@ User can now launch, Refresh models, Check ACE service, and Generate with the pr
 - All FLUX-speed in-tree edits to `flux.py`, `streaming_linear.py`, `kraken_flux_attn.py`.
 
 These will be committed (or formally discarded) in a separate FLUX-speed commit. They are NOT lost — they're on disk under `feature/audio-integration` and the next commit will sort them out.
+
+---
+
+## 13. Phase B — Suno-style Music tab UI (2026-05-23 18:53 UTC start)
+
+**Author:** Claude (continued from §12).
+
+**Per-user-directive:** "document and back up as you go." This section is updated after each milestone, not just at the end.
+
+### 13.0 — Pre-work setup (2026-05-23 18:53 UTC)
+
+- **Checkpoint tag created:** `checkpoint/2026-05-23-1853-pre-phase-b-music-ui` (pushed to origin). Recovery point for the entire Phase B effort.
+- **Filesystem backup:** `backups/2026-05-23-1853-pre-phase-b-music-ui/` — snapshot of the 4 files Phase B will modify:
+  - `src/Music.tsx` (current ~293 line single-pane prompt+lyrics+player layout — will be rewritten)
+  - `src/App.tsx` (only minor changes expected — keep the `<Music models={models} sidecar={sidecar} />` line)
+  - `src/App.css` (new styles for the grid + player bar + sidebar — additions only, no edits to existing rules)
+  - `src/api/sidecar.ts` (new `Song`, `Workspace`, `Playlist` types + getLibrary/getPlaylists/deleteSong/bulkDeleteSongs/etc. wrappers)
+- **Branch state:** `feature/audio-integration` at commit `8c26b93` (Phase A docs landed).
+- **Approach:** 3 incremental commits, each with its own checkpoint tag.
+
+### 13.1 — Planned increments
+
+| # | Commit | Visible result |
+|---|---|---|
+| B1 | Library load + center grid + checkbox multi-select + bulk delete toolbar | User sees all 364 songs in a Suno-style grid; can multi-select + delete. |
+| B2 | Left sidebar (workspaces + playlists) + create/rename workspace + create playlist + drag-or-button-add songs to playlist | Organization works like Suno's left pane. |
+| B3 | Persistent bottom player bar (cover thumb + title + prev/play/next + scrubber + volume) | Suno-style always-visible playback. |
+
+Each commit will be followed by:
+- A new sub-section here (13.2, 13.3, 13.4) with the exact files changed, commit hash, and a brief "what works now" line.
+- A `checkpoint/2026-05-23-HHMM-phase-b-{1,2,3}-{slug}` git tag.
+
+CHANGELOG.md will get one summary entry at the end of Phase B (after B3 lands), pointing at the three commits + tags.
+
+### 13.2 — B1 landed: library grid + multi-select + bulk delete (2026-05-23 19:25 UTC)
+
+**Files modified:**
+- `src/Music.tsx` — full rewrite. Center pane is now a Suno-style song grid pulling from `/api/audio/library`. Right pane keeps the existing generation form (now also reads the Song Studio model catalog so the dropdown has real entries: ACE-Step 1.5 Turbo, Stable Audio 3 Medium/Small Music/Small SFX).
+- `src/api/sidecar.ts` — added `Song`, `Playlist`, `SongStudioHealth`, `SongStudioModel` types + 10 helpers (`songStudioHealth`, `getSongLibrary`, `getPlaylists`, `createPlaylist`, `addSongsToPlaylist`, `createWorkspace`, `renameWorkspace`, `deleteSong`, `bulkDeleteSongs`, `songStreamUrl`, `songDownloadUrl`). Also extended the `Settings` type with `lastGenerate` (fixes a pre-existing TS error in Generate.tsx that was already on the branch from Cursor's lastGenerate persistence work).
+- `src/App.css` — appended Music-tab styles (`.music-toolbar`, `.song-grid`, `.song-card`, `.song-cover`, `.song-info`, `.inline-player`, `.error-box`, `.job-status-box`). No existing rules modified.
+- `src/Generate.tsx` — one-line param type annotation fix (`(name: string)`) to match the new `lastGenerate` shape. Behavior unchanged.
+
+**What works now:**
+- Open the ♪ Music tab → all 364 library songs render as a grid of cards with cover thumbs (or a ♪ fallback if no cover yet), title, workspace, duration.
+- Search box filters by title / workspace / summary / prompt.
+- Click a card → selected (active state) → inline `<audio>` player appears at the bottom of the center pane and autoplays.
+- Checkbox on each card → multi-select. Toolbar switches to "N selected · Delete · Clear" when anything is selected.
+- "Select all" / "Refresh" buttons in the toolbar when no selection is active.
+- Bulk delete confirms then POSTs to `/api/audio/songs/bulk-delete` and optimistically removes the rows.
+- Single-song ✕ button appears on card hover for one-off deletes.
+- Right pane: generation form now reads the dropdown live from Song Studio's `generationModels` catalog (matches the screenshot the user provided). Includes a Song Studio health indicator that surfaces the "ComfyUI offline" status — visible reminder of what Phase C will fix.
+- TypeScript compiles clean (pre-existing TS6133 unused-var warnings unaffected).
+
+**Intentionally deferred to B2 / B3 / Phase C:**
+- LEFT pane (workspaces + playlists sidebar) — B2.
+- Persistent bottom player bar (currently the player is inline at the bottom of the center pane; works fine, just less Suno-like). — B3.
+- "Add selected to playlist" toolbar action — B2 (depends on playlist CRUD UI being built first).
+- Cover image proxy may need its own endpoint if `/api/audio/stream` mistypes the Content-Type for JPEGs. Visual confirmation in-app will tell us.
+- ComfyUI cover replacement — Phase C.
+
+**Commit / tag (filled in when this lands):** see Section 13.3 below.

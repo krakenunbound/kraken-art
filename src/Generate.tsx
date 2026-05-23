@@ -291,7 +291,7 @@ export default function Generate({
     }
     if (lg.te?.length) {
       // Only keep entries that still exist
-      const valid = lg.te.filter((name) => existsIn("text_encoders", name));
+      const valid = lg.te.filter((name: string) => existsIn("text_encoders", name));
       if (valid.length) {
         setTe(valid);
         didRestore = true;

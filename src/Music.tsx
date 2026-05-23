@@ -1,11 +1,19 @@
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  audioFileUrl,
   audioGenerate,
+  audioHealth,
+  bulkDeleteSongs,
   cancelAudioJob,
+  deleteSong as deleteSongApi,
   getAudioJob,
+  getSongLibrary,
   type AudioHealth,
   type ModelListing,
+  type Song,
+  type SongStudioHealth,
+  type SongStudioModel,
+  songStreamUrl,
+  songStudioHealth,
 } from "./api/sidecar";
 
 interface MusicProps {
@@ -13,33 +21,175 @@ interface MusicProps {
   sidecar: string; // "up" | "down" | "checking"
 }
 
+// Format helpers --------------------------------------------------------------
+
+function fmtDuration(seconds?: number | null): string {
+  if (!seconds || seconds <= 0) return "?:??";
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function coverUrl(song: Song): string | null {
+  // Song Studio serves arbitrary files via /api/audio?path=... — we proxy that
+  // through our /api/audio/stream. Works for both audio and image bytes because
+  // the upstream just sets Content-Type from the file extension.
+  const p = song.coverPath || song.cover_image || song.cover_path;
+  return p ? songStreamUrl(p) : null;
+}
+
+function firstAudioPath(song: Song): string | null {
+  if (song.audioPath) return song.audioPath;
+  if (song.audio_path) return song.audio_path;
+  if (Array.isArray(song.audioPaths) && song.audioPaths.length > 0) return song.audioPaths[0];
+  if (Array.isArray((song as any).audio_paths) && (song as any).audio_paths.length > 0) {
+    return (song as any).audio_paths[0];
+  }
+  return null;
+}
+
+// Main component --------------------------------------------------------------
+
 export default function Music({ models, sidecar }: MusicProps) {
-  // Form state
+  // ---- Library state (B1) ---------------------------------------------------
+  const [library, setLibrary] = useState<Song[]>([]);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [search, setSearch] = useState("");
+  const [activeSong, setActiveSong] = useState<Song | null>(null);
+  const [bulkBusy, setBulkBusy] = useState(false);
+
+  // ---- Song Studio health + model catalog ----------------------------------
+  const [ssHealth, setSsHealth] = useState<SongStudioHealth | null>(null);
+  const [ssModels, setSsModels] = useState<SongStudioModel[]>([]);
+
+  // ---- Form state (generation; right pane — unchanged behavior) -----------
   const [prompt, setPrompt] = useState("cinematic space odyssey, vast choirs, pulsing synths, emotional climax");
   const [lyrics, setLyrics] = useState("");
-  const [selectedModel, setSelectedModel] = useState("");
+  const [selectedModelId, setSelectedModelId] = useState<string>("");
   const [bpm, setBpm] = useState(128);
   const [duration, setDuration] = useState(75);
   const [temperature, setTemperature] = useState(0.9);
   const [generateCover, setGenerateCover] = useState(true);
   const [coverPrompt, setCoverPrompt] = useState("");
 
-  // Job / progress state
+  // ---- Job / progress state -----------------------------------------------
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<string | null>(null);
-  const [progress, setProgress] = useState(0);
   const [progressMsg, setProgressMsg] = useState("");
-  const [result, setResult] = useState<any>(null);
   const [busy, setBusy] = useState(false);
 
-  // ACE service health (local to this tab)
+  // ---- ACE service health (legacy, bare engine) ---------------------------
   const [aceHealth, setAceHealth] = useState<AudioHealth | null>(null);
   const [aceChecking, setAceChecking] = useState(false);
 
+  // ---- Library loader ------------------------------------------------------
+  const reloadLibrary = useCallback(async () => {
+    if (sidecar !== "up") return;
+    setLibraryLoading(true);
+    setLibraryError(null);
+    try {
+      const data = await getSongLibrary();
+      const songs = Array.isArray(data.songs) ? data.songs : [];
+      setLibrary(songs);
+    } catch (e: any) {
+      setLibraryError(String(e?.message ?? e));
+    } finally {
+      setLibraryLoading(false);
+    }
+  }, [sidecar]);
+
+  // Initial load + Song Studio health probe ----------------------------------
+  useEffect(() => {
+    if (sidecar !== "up") return;
+    reloadLibrary();
+    (async () => {
+      try {
+        const h = await songStudioHealth();
+        setSsHealth(h);
+        if (h.ok && h.config?.generationModels) {
+          setSsModels(h.config.generationModels);
+          if (!selectedModelId && h.config.defaultGenerationModel) {
+            setSelectedModelId(h.config.defaultGenerationModel);
+          }
+        }
+      } catch (e: any) {
+        setSsHealth({ ok: false, base_url: "?", error: String(e?.message ?? e) });
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sidecar]);
+
+  // ---- Selection helpers ---------------------------------------------------
+  const toggleSelected = useCallback((songId: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(songId)) next.delete(songId);
+      else next.add(songId);
+      return next;
+    });
+  }, []);
+  const clearSelection = useCallback(() => setSelectedIds(new Set()), []);
+  const selectAll = useCallback(() => {
+    setSelectedIds(new Set(filtered.map(s => s.id)));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [library, search]);
+
+  // ---- Filtered library (search) -------------------------------------------
+  const filtered = useMemo(() => {
+    if (!search.trim()) return library;
+    const q = search.trim().toLowerCase();
+    return library.filter(s =>
+      (s.title || "").toLowerCase().includes(q) ||
+      (s.workspaceTitle || "").toLowerCase().includes(q) ||
+      (s.summary || "").toLowerCase().includes(q) ||
+      (s.prompt || "").toLowerCase().includes(q)
+    );
+  }, [library, search]);
+
+  // ---- Bulk actions --------------------------------------------------------
+  async function onBulkDelete() {
+    if (selectedIds.size === 0) return;
+    const n = selectedIds.size;
+    if (!window.confirm(`Delete ${n} song${n === 1 ? "" : "s"} permanently? This removes the audio files from disk.`)) return;
+    setBulkBusy(true);
+    try {
+      const ids = Array.from(selectedIds);
+      await bulkDeleteSongs(ids);
+      // Optimistic: drop deleted ids from local library state, then reload to be sure.
+      setLibrary(prev => prev.filter(s => !selectedIds.has(s.id)));
+      setSelectedIds(new Set());
+      if (activeSong && ids.includes(activeSong.id)) setActiveSong(null);
+      reloadLibrary();
+    } catch (e: any) {
+      window.alert(`Bulk delete failed: ${e?.message ?? e}`);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  async function onDeleteSingle(song: Song) {
+    if (!window.confirm(`Delete "${song.title || song.id}" permanently?`)) return;
+    try {
+      await deleteSongApi(song.id);
+      setLibrary(prev => prev.filter(s => s.id !== song.id));
+      setSelectedIds(prev => {
+        const next = new Set(prev);
+        next.delete(song.id);
+        return next;
+      });
+      if (activeSong?.id === song.id) setActiveSong(null);
+    } catch (e: any) {
+      window.alert(`Delete failed: ${e?.message ?? e}`);
+    }
+  }
+
+  // ---- ACE engine health (right-pane helper) -------------------------------
   async function checkAce() {
     setAceChecking(true);
     try {
-      const resp = await (await import("./api/sidecar")).audioHealth();
+      const resp = await audioHealth();
       setAceHealth(resp);
     } catch (e: any) {
       setAceHealth({ ok: false, detail: String(e?.message ?? e) });
@@ -48,20 +198,19 @@ export default function Music({ models, sidecar }: MusicProps) {
     }
   }
 
+  // ---- Generation flow -----------------------------------------------------
   async function submit() {
     if (sidecar !== "up") return;
     setBusy(true);
     setJobId(null);
     setJobStatus(null);
-    setProgress(0);
     setProgressMsg("Submitting to orchestrator...");
-    setResult(null);
 
     try {
       const payload = {
         prompt,
         lyrics,
-        ace_model: selectedModel || null,
+        ace_model: selectedModelId || null,
         bpm,
         key_scale: "C",
         duration,
@@ -71,25 +220,20 @@ export default function Music({ models, sidecar }: MusicProps) {
         thinking: false,
         sample_mode: false,
       };
-
       const resp = await audioGenerate(payload);
       const jid = resp.job_id;
       setJobId(jid);
       setJobStatus(resp.status);
 
-      // Poll until done
       const poll = async () => {
         try {
           const snap = await getAudioJob(jid);
           setJobStatus(snap.status);
-
           if (snap.progress?.message) setProgressMsg(snap.progress.message);
-
           if (snap.result) {
-            setResult(snap.result);
-            setProgress(1);
-            setProgressMsg("Complete — audio ready for playback");
+            setProgressMsg("Complete — refreshing library...");
             setBusy(false);
+            await reloadLibrary();
             return;
           }
           if (snap.error) {
@@ -124,128 +268,212 @@ export default function Music({ models, sidecar }: MusicProps) {
     }
   }
 
-  const audioModels = models?.categories?.audio ?? [];
+  // ---- Render --------------------------------------------------------------
+  // Render: legacy `audio` model list (from filesystem scan) is unused in the
+  // dropdown now — we use the Song Studio's live catalog instead. The scan
+  // count stays in the left pane for parity but is informational.
+  const fsAudioModelCount = models?.categories?.audio?.length ?? 0;
 
   return (
     <>
-      {/* Center pane — creative flow (prompt, lyrics, big button, progress, results) */}
-      <main className="pane center gen-center" style={{ padding: 20, overflow: "auto" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
-          <span style={{ fontSize: 28 }}>♪</span>
-          <div>
-            <div style={{ fontSize: 20, fontWeight: 600 }}>Music — ACE-Step</div>
-            <div style={{ color: "var(--muted)", fontSize: 12 }}>
-              Using your existing Kraken_Audio installation (no model duplication)
-            </div>
+      {/* Center pane — Suno-style library grid + toolbar ------------------- */}
+      <main className="pane center gen-center music-center">
+        <div className="music-toolbar">
+          <div className="music-toolbar-title">
+            <span style={{ fontSize: 22 }}>♪</span>
+            <strong>Music Library</strong>
+            <span className="muted small" style={{ marginLeft: 6 }}>
+              {libraryLoading ? "loading..." : `${library.length} song${library.length === 1 ? "" : "s"}`}
+              {search && library.length !== filtered.length && ` · ${filtered.length} match`}
+            </span>
           </div>
-        </div>
-
-        <div className="prompt-stack">
-          <label className="lbl">Prompt / Caption</label>
-          <textarea
-            rows={3}
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            placeholder="epic orchestral journey through a dying star, cinematic, emotional"
+          <input
+            className="music-search"
+            type="text"
+            placeholder="Search titles, workspaces, prompts..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
           />
-
-          <label className="lbl" style={{ marginTop: 8 }}>Lyrics (optional)</label>
-          <textarea
-            rows={6}
-            value={lyrics}
-            onChange={(e) => setLyrics(e.target.value)}
-            placeholder="[Verse 1]\nWe sailed the edge of night...\n[Chorus]\n..."
-            style={{ fontFamily: "monospace", fontSize: 13 }}
-          />
-        </div>
-
-        <div className="action-row" style={{ marginTop: 12 }}>
-          <button
-            className="primary big"
-            onClick={submit}
-            disabled={busy || sidecar !== "up"}
-          >
-            {busy ? "Working..." : "♪ Generate with ACE-Step"}
-          </button>
-          {jobId && <button onClick={cancel}>Cancel</button>}
-          <div className="spacer" />
-          <div style={{ fontSize: 12, color: "var(--muted)" }}>
-            Cover (if checked) is generated with Kraken Art's internal FLUX/SDXL first.
-          </div>
-        </div>
-
-        {/* Live job progress */}
-        {jobId && jobStatus && (
-          <div style={{ marginTop: 16, background: "#0b0f16", padding: 14, borderRadius: 6 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6, fontSize: 13 }}>
-              <div><b>Job:</b> {jobId.slice(0, 8)}… &nbsp; <b>Status:</b> {jobStatus}</div>
-              <div>{progressMsg}</div>
-            </div>
-            <div style={{ height: 6, background: "#1f2937", borderRadius: 3, overflow: "hidden" }}>
-              <div style={{ width: `${Math.min(100, progress * 100)}%`, height: "100%", background: "#22c55e", transition: "width 200ms" }} />
-            </div>
-
-            {result && (
-              <div style={{ marginTop: 12, color: "var(--c-good)", fontSize: 13 }}>
-                Done!
-                {(result.audio_paths || []).length > 0 ? (
-                  (result.audio_paths as string[]).map((p: string, idx: number) => (
-                    <div key={idx} style={{ marginTop: 8 }}>
-                      <audio controls src={audioFileUrl(p)} style={{ width: "100%", maxWidth: 520 }} />
-                      <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{p}</div>
-                    </div>
-                  ))
-                ) : (
-                  <pre style={{ fontSize: 11, marginTop: 8, whiteSpace: "pre-wrap" }}>{JSON.stringify(result, null, 2)}</pre>
-                )}
-                {result.cover_path && (
-                  <div style={{ marginTop: 8, fontSize: 12 }}>
-                    Album cover saved by Kraken Art: <code>{result.cover_path}</code>
-                  </div>
-                )}
-              </div>
+          <div className="music-toolbar-actions">
+            {selectedIds.size > 0 ? (
+              <>
+                <span className="muted small">{selectedIds.size} selected</span>
+                <button onClick={onBulkDelete} disabled={bulkBusy} className="danger">
+                  {bulkBusy ? "Deleting..." : "Delete"}
+                </button>
+                <button onClick={clearSelection}>Clear</button>
+              </>
+            ) : (
+              <>
+                <button onClick={selectAll} disabled={filtered.length === 0}>Select all</button>
+                <button onClick={reloadLibrary} disabled={libraryLoading}>
+                  {libraryLoading ? "..." : "Refresh"}
+                </button>
+              </>
             )}
           </div>
+        </div>
+
+        {libraryError && (
+          <div className="error-box">
+            Library load failed: {libraryError}
+            <button onClick={reloadLibrary} style={{ marginLeft: 8 }}>Retry</button>
+          </div>
         )}
+
+        {!libraryError && !libraryLoading && library.length === 0 && (
+          <div className="muted" style={{ padding: 30, textAlign: "center" }}>
+            No songs yet. Use the generation form on the right to create one — or check that
+            Song Studio is running on port 8010.
+          </div>
+        )}
+
+        <div className="song-grid">
+          {filtered.map((song) => {
+            const isSelected = selectedIds.has(song.id);
+            const isActive = activeSong?.id === song.id;
+            const cover = coverUrl(song);
+            return (
+              <div
+                key={song.id}
+                className={"song-card" + (isSelected ? " selected" : "") + (isActive ? " active" : "")}
+                onClick={() => setActiveSong(song)}
+              >
+                <label
+                  className="song-checkbox"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <input
+                    type="checkbox"
+                    checked={isSelected}
+                    onChange={() => toggleSelected(song.id)}
+                  />
+                </label>
+
+                <div className="song-cover">
+                  {cover ? (
+                    <img
+                      src={cover}
+                      alt=""
+                      loading="lazy"
+                      onError={(e) => {
+                        (e.target as HTMLImageElement).style.display = "none";
+                      }}
+                    />
+                  ) : (
+                    <div className="song-cover-fallback">♪</div>
+                  )}
+                </div>
+
+                <div className="song-info">
+                  <div className="song-title" title={song.title}>
+                    {song.title || "(untitled)"}
+                  </div>
+                  <div className="song-meta">
+                    <span title={song.workspaceTitle}>{song.workspaceTitle || "—"}</span>
+                    <span>·</span>
+                    <span>{fmtDuration(song.duration)}</span>
+                  </div>
+                  {song.summary && (
+                    <div className="song-summary muted small">{song.summary}</div>
+                  )}
+                </div>
+
+                <div className="song-actions" onClick={(e) => e.stopPropagation()}>
+                  <button
+                    title="Delete this song"
+                    className="icon danger-ghost"
+                    onClick={() => onDeleteSingle(song)}
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Inline player (temporary — replaced by the persistent bottom bar in B3) */}
+        {activeSong && (() => {
+          const ap = firstAudioPath(activeSong);
+          return (
+            <div className="inline-player">
+              <div style={{ fontSize: 13, marginBottom: 4 }}>
+                <b>{activeSong.title || activeSong.id}</b>
+                <span className="muted small" style={{ marginLeft: 8 }}>
+                  {activeSong.workspaceTitle} · {fmtDuration(activeSong.duration)}
+                </span>
+              </div>
+              {ap ? (
+                <audio controls autoPlay src={songStreamUrl(ap)} style={{ width: "100%" }} />
+              ) : (
+                <div className="muted small">No playable audio file for this song.</div>
+              )}
+            </div>
+          );
+        })()}
       </main>
 
-      {/* Right pane — model selectors & settings (exactly like Generate.tsx) */}
+      {/* Right pane — generation form (unchanged behavior, scrollable) ----- */}
       <aside className="pane right-params" style={{ padding: 14, overflowY: "auto" }}>
-        <div className="section-title">ACE Engine</div>
-
+        <div className="section-title">Song Studio</div>
         <div className="field">
-          <button onClick={checkAce} disabled={aceChecking || sidecar !== "up"} style={{ fontSize: 12, width: "100%" }}>
-            {aceChecking ? "Checking..." : "Check ACE service (port 8001)"}
-          </button>
-          {!aceHealth ? (
-            <div className="muted small" style={{ marginTop: 6 }}>Click above to verify the finished Kraken_Audio engine is running.</div>
-          ) : aceHealth.ok ? (
-            <div style={{ color: "var(--c-good)", fontSize: 12, marginTop: 6 }}>ACE service healthy ✓</div>
+          {ssHealth?.ok ? (
+            <div style={{ color: "var(--c-good)", fontSize: 12 }}>
+              Song Studio ✓ ({ssHealth.base_url})
+              {ssHealth.config?.coverArtStatus?.toLowerCase().includes("offline") && (
+                <div className="muted small" style={{ marginTop: 4 }}>
+                  Cover-art legacy ComfyUI offline — Phase C will reroute to Kraken Art's FLUX/SDXL.
+                </div>
+              )}
+            </div>
           ) : (
-            <div style={{ color: "var(--c-bad)", fontSize: 12, marginTop: 6 }}>ACE not reachable — start it with your normal Kraken_Audio launcher first.</div>
+            <div style={{ color: "var(--c-bad)", fontSize: 12 }}>
+              Song Studio not reachable at port 8010. Start it via the Kraken_Audio launcher.
+              {ssHealth?.error && <div className="muted small" style={{ marginTop: 4 }}>{ssHealth.error}</div>}
+            </div>
           )}
         </div>
 
-        <div className="section-title" style={{ marginTop: 16 }}>Model</div>
+        <div className="section-title" style={{ marginTop: 12 }}>Model</div>
         <div className="field">
           <select
-            value={selectedModel}
-            onChange={(e) => setSelectedModel(e.target.value)}
+            value={selectedModelId}
+            onChange={(e) => setSelectedModelId(e.target.value)}
             style={{ width: "100%" }}
+            disabled={ssModels.length === 0}
           >
-            <option value="">(auto — let ACE pick)</option>
-            {audioModels.map((m, i) => (
-              <option key={i} value={m.abs_path}>
-                {m.filename} — {(m.size_bytes / 1e9).toFixed(1)} GB
+            {ssModels.length === 0 && <option value="">(Song Studio not ready)</option>}
+            {ssModels.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}{m.params ? ` — ${m.params}` : ""}{m.recommended ? " — recommended" : ""}
               </option>
             ))}
           </select>
           <div className="muted small" style={{ marginTop: 4 }}>
-            {audioModels.length} audio model(s) found via Refresh Models
+            {ssModels.length > 0
+              ? `${ssModels.length} model(s) — live from Song Studio's catalog`
+              : `${fsAudioModelCount} filesystem model(s) found; Song Studio not reporting catalog yet`}
           </div>
         </div>
 
-        <div className="section-title" style={{ marginTop: 16 }}>Album Cover</div>
+        <div className="section-title" style={{ marginTop: 12 }}>Prompt</div>
+        <div className="field">
+          <textarea rows={3} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
+        </div>
+
+        <div className="section-title" style={{ marginTop: 8 }}>Lyrics (optional)</div>
+        <div className="field">
+          <textarea
+            rows={5}
+            value={lyrics}
+            onChange={(e) => setLyrics(e.target.value)}
+            placeholder="[Verse 1]&#10;..."
+            style={{ fontFamily: "monospace", fontSize: 12 }}
+          />
+        </div>
+
+        <div className="section-title" style={{ marginTop: 12 }}>Album Cover</div>
         <div className="field">
           <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
             <input
@@ -258,17 +486,14 @@ export default function Music({ models, sidecar }: MusicProps) {
           {generateCover && (
             <input
               style={{ marginTop: 6, width: "100%" }}
-              placeholder="Cover prompt (optional)"
+              placeholder="Cover prompt override (optional)"
               value={coverPrompt}
               onChange={(e) => setCoverPrompt(e.target.value)}
             />
           )}
-          <div className="muted small" style={{ marginTop: 4 }}>
-            This redirects what the old Kraken_Audio used to call ComfyUI for.
-          </div>
         </div>
 
-        <div className="section-title" style={{ marginTop: 16 }}>Parameters</div>
+        <div className="section-title" style={{ marginTop: 12 }}>Parameters</div>
         <div className="field-row">
           <div className="field">
             <label>BPM</label>
@@ -280,12 +505,52 @@ export default function Music({ models, sidecar }: MusicProps) {
           </div>
           <div className="field">
             <label>Temperature</label>
-            <input type="number" step="0.05" value={temperature} onChange={(e) => setTemperature(parseFloat(e.target.value) || 0.85)} />
+            <input
+              type="number"
+              step="0.05"
+              value={temperature}
+              onChange={(e) => setTemperature(parseFloat(e.target.value) || 0.85)}
+            />
           </div>
         </div>
 
-        <div style={{ marginTop: 20, fontSize: 11, color: "var(--muted)" }}>
-          The actual heavy synthesis runs in your existing finished ACE-Step process (the one on port 8001). Kraken Art only orchestrates + generates the cover.
+        <div className="action-row" style={{ marginTop: 14 }}>
+          <button className="primary big" onClick={submit} disabled={busy || sidecar !== "up"}>
+            {busy ? "Working..." : "♪ Generate"}
+          </button>
+          {jobId && <button onClick={cancel}>Cancel</button>}
+        </div>
+
+        {jobId && (
+          <div className="job-status-box" style={{ marginTop: 12 }}>
+            <div style={{ fontSize: 12 }}>
+              <b>Job:</b> {jobId.slice(0, 8)}… &nbsp; <b>Status:</b> {jobStatus}
+            </div>
+            <div className="muted small" style={{ marginTop: 4 }}>{progressMsg}</div>
+          </div>
+        )}
+
+        <div className="section-title" style={{ marginTop: 16 }}>Bare ACE-Step (legacy)</div>
+        <div className="field">
+          <button onClick={checkAce} disabled={aceChecking || sidecar !== "up"} style={{ fontSize: 12, width: "100%" }}>
+            {aceChecking ? "Checking..." : "Check ACE on port 8001"}
+          </button>
+          {aceHealth && (
+            <div
+              style={{
+                color: aceHealth.ok ? "var(--c-good)" : "var(--c-bad)",
+                fontSize: 11,
+                marginTop: 4,
+              }}
+            >
+              {aceHealth.ok ? "ACE healthy" : "ACE unreachable"}
+            </div>
+          )}
+        </div>
+
+        <div style={{ marginTop: 18, fontSize: 11, color: "var(--muted)" }}>
+          Heavy synthesis runs in the existing Kraken_Audio process. Kraken Art only orchestrates +
+          generates covers. Library views the same files Song Studio knows about.
         </div>
       </aside>
     </>

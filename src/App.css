@@ -754,3 +754,217 @@ button.big { padding: 9px 22px; font-size: 14px; letter-spacing: 0.04em; }
   padding: 0 6px;
 }
 .restart-banner .banner-close:hover { color: #fff; }
+
+/* =============================================================================
+   Music tab — Suno-style library (Phase B1, 2026-05-23)
+   ========================================================================== */
+
+.music-center {
+  padding: 14px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.music-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 4px;
+  border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.06));
+  position: sticky;
+  top: 0;
+  background: var(--bg, #0a0e15);
+  z-index: 5;
+  flex-wrap: wrap;
+}
+.music-toolbar-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+.music-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.music-toolbar-actions button {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+.music-toolbar-actions button.danger {
+  background: #b94343;
+  color: #fff;
+  border-color: #b94343;
+}
+.music-toolbar-actions button.danger:hover { background: #d65555; }
+
+.music-search {
+  flex: 1 1 220px;
+  min-width: 160px;
+  padding: 6px 10px;
+  font-size: 13px;
+  background: #11161f;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  color: var(--fg, #e8e8e8);
+}
+.music-search:focus {
+  outline: none;
+  border-color: var(--accent, #00e5ff);
+}
+
+.song-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+  padding: 4px 0 12px 0;
+}
+
+.song-card {
+  position: relative;
+  background: #11161f;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 8px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color 0.15s, transform 0.08s;
+}
+.song-card:hover {
+  border-color: rgba(0, 229, 255, 0.35);
+}
+.song-card.selected {
+  border-color: var(--accent, #00e5ff);
+  box-shadow: 0 0 0 1px rgba(0, 229, 255, 0.4) inset;
+}
+.song-card.active {
+  background: #182030;
+}
+
+.song-checkbox {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 2;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 2px 4px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+}
+.song-checkbox input { cursor: pointer; }
+
+.song-actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.song-card:hover .song-actions { opacity: 1; }
+.song-actions button.icon {
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.song-actions button.danger-ghost:hover {
+  background: rgba(185, 67, 67, 0.85);
+  border-color: #b94343;
+}
+
+.song-cover {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  background: linear-gradient(135deg, #1a2435 0%, #0a1220 100%);
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.song-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.song-cover-fallback {
+  font-size: 38px;
+  color: rgba(255, 255, 255, 0.25);
+  user-select: none;
+}
+
+.song-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  min-width: 0;
+}
+.song-title {
+  font-weight: 600;
+  color: var(--fg, #e8e8e8);
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.song-meta {
+  display: flex;
+  gap: 4px;
+  align-items: baseline;
+  color: var(--muted, #8a93a3);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.song-summary {
+  margin-top: 2px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 11px;
+}
+
+.inline-player {
+  position: sticky;
+  bottom: 0;
+  background: #0c1118;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 10px 12px;
+  margin: 8px -14px -14px -14px; /* extend to pane edges */
+  z-index: 6;
+}
+
+.error-box {
+  background: rgba(185, 67, 67, 0.12);
+  border: 1px solid rgba(185, 67, 67, 0.35);
+  color: #ffb0b0;
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.job-status-box {
+  background: #0b0f16;
+  padding: 10px 12px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}

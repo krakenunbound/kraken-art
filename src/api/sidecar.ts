@@ -121,6 +121,111 @@ export const cancelAudioJob = (jobId: string) =>
 export const audioFileUrl = (absPath: string) =>
   `/api/audio/file?path=${encodeURIComponent(absPath)}`;  // relative to the sidecar — works in Tauri webview
 
+// ---------- Song Studio (port 8010 — workstation: library, playlists, etc.) ----------
+//
+// All these go through our /api/audio/* proxy. The webview never talks to
+// 8010 directly. See python/api/audio.py for the proxy implementations.
+
+export type SongStudioModel = {
+  id: string;
+  label: string;
+  provider: string;
+  params?: string;
+  local?: boolean;
+  recommended?: boolean;
+  status?: string;
+  notes?: string;
+};
+
+export type SongStudioHealth = {
+  ok: boolean;
+  base_url: string;
+  config?: {
+    assistantReady?: boolean;
+    assistantProvider?: string;
+    assistantStatus?: string;
+    voiceCloneReady?: boolean;
+    voiceCloneStatus?: string;
+    coverArtReady?: boolean;
+    coverArtStatus?: string;
+    generationModels?: SongStudioModel[];
+    defaultGenerationModel?: string;
+    defaultWorkspace?: string;
+    aceApiBaseUrl?: string;
+  };
+  error?: string;
+};
+
+export type Song = {
+  id: string;
+  title?: string;
+  summary?: string;
+  prompt?: string;
+  lyrics?: string;
+  workspaceId?: string;
+  workspaceTitle?: string;
+  workspaceKind?: string;
+  bpm?: number | null;
+  key?: string | null;
+  language?: string | null;
+  duration?: number | null;
+  status?: string;
+  createdAt?: string;
+  coverPath?: string;
+  audioPath?: string;
+  audioPaths?: string[];
+  styleTags?: string;
+  folder?: string;
+  // Song Studio uses camelCase OR snake_case in different fields — keep loose:
+  [extra: string]: any;
+};
+
+export type Playlist = {
+  id: string;
+  title: string;
+  songIds?: string[];
+  songs?: Song[];
+  [extra: string]: any;
+};
+
+export const songStudioHealth = () =>
+  getJSON<SongStudioHealth>("/api/audio/song-studio/health");
+
+export const getSongLibrary = () =>
+  getJSON<{ songs: Song[] }>("/api/audio/library");
+
+export const getPlaylists = () =>
+  getJSON<{ playlists: Playlist[] }>("/api/audio/playlists");
+
+export const createPlaylist = (title: string) =>
+  postJSON<Playlist>("/api/audio/playlists", { title });
+
+export const addSongsToPlaylist = (playlistId: string, songIds: string[]) =>
+  postJSON<any>(`/api/audio/playlists/${playlistId}/songs`, { songIds });
+
+export const createWorkspace = (title: string) =>
+  postJSON<any>("/api/audio/workspaces", { title });
+
+export const renameWorkspace = (workspaceId: string, title: string) =>
+  patchJSON<any>(`/api/audio/workspaces/${workspaceId}`, { title });
+
+export const deleteSong = async (songId: string) => {
+  // Reuse the same JSON util but with DELETE method
+  const url = `/api/audio/songs/${songId}`;
+  const r = await fetch(url, { method: "DELETE" });
+  if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+  return r.json().catch(() => ({ ok: true }));
+};
+
+export const bulkDeleteSongs = (songIds: string[]) =>
+  postJSON<any>("/api/audio/songs/bulk-delete", { songIds });
+
+export const songStreamUrl = (path: string) =>
+  `/api/audio/stream?path=${encodeURIComponent(path)}`;
+
+export const songDownloadUrl = (songId: string) =>
+  `/api/audio/songs/${songId}/download`;
+
 // ---------- Generation ----------
 
 export type LoraEntry = { name: string; weight: number };
@@ -203,6 +308,17 @@ export type Settings = {
     // fully resident (faster) at higher OOM risk mid-step.
     flux_fast_inference_buffer_gb: number;
   };
+  // Last Generate-tab setup. Restored on next launch if the named models still
+  // exist in the current scan. Written by Generate.tsx, persisted via
+  // config_store.lastGenerate.
+  lastGenerate?: {
+    archId?: string;
+    checkpoint?: string;
+    diffusionModel?: string;
+    vae?: string;
+    te?: string[];
+    [extra: string]: any;
+  } | null;
 };
 
 // Shape saved by the Generate tab so the user's last choices are restored on next launch.
