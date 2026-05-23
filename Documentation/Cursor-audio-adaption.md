@@ -646,3 +646,150 @@ Next phases queued (not started):
   internal FLUX/SDXL instead of the dead ComfyUI dependency.
 - **Phase D**: MP3 320 kbps export with embedded cover art (verify Song
   Studio's existing path + add a mutagen fallback inside the proxy).
+## 14. Phase C — Cover-art redirect (ComfyUI → Kraken Art) (2026-05-23 19:40 UTC start)
+
+### 14.0 — Pre-work setup (2026-05-23 19:40 UTC)
+
+- Filesystem backup: `backups/2026-05-23-1940-pre-phase-c-cover-art/`
+  (civitai.py, generate.py, audio.py, flux.py, sdxl.py, doc files, and
+  — once edited — the original Kraken_Audio `codex_song_studio.py.original`).
+- Pre-work tag: `checkpoint/2026-05-23-1940-pre-phase-c-cover-art` (pushed).
+- Branch going in: `ec81868` (Phase B docs backfill).
+
+### 14.1 — Strategy
+
+User chose strategy 1: patch Song Studio to call Kraken Art directly (no
+ComfyUI-protocol shim). API shape: synchronous POST /api/cover-art that
+returns the saved image path + URL. Picked by elimination — Song Studio's
+existing cover-art worker is already a thread doing its own polling, so a
+sync HTTP call avoids stacking a second async-job-id layer for zero gain.
+
+User picked **Z-Image Turbo as the target cover model**, specifically the
+Civitai `GonzaLomo ZPop v4.0` fine-tune (modelVersionId 2932204, fileId
+2811471, BF16 11.7 GB).
+
+### 14.2 — Civitai API token: real state of affairs (2026-05-23 19:42 UTC)
+
+Discovered that the Civitai API token was **not on disk** despite the user
+believing it had been saved yesterday. `config/settings.json` contained
+only the `performance` block. Whatever happened yesterday — UI didn't
+fire `PATCH /api/settings`, save raced with shutdown, or token was only in
+React state — the on-disk store had no `civitai` section at all.
+
+User pasted the token directly (logged here as `redacted`); written to
+`config/settings.json` (gitignored, verified at `.gitignore:39`). Civitai
+auth tested with a real `HEAD` on the GonzaLomo ZPop download URL →
+`HTTP 307` redirect to B2 signed URL → confirmed auth works.
+
+### 14.3 — Civitai download (2026-05-23 19:45 UTC)
+
+- File: `models/diffusion_models/ZImageTurbo/gonzalomoZpop_v40.safetensors`
+- Size on disk: 12,309,944,192 bytes (11.46 GiB)
+- SHA-256: `f658b4ccf066a8652333cf03727f829fa63bd6ec1f49d302b8c46b13732aedbc`
+- Matches Civitai's published hash → file is intact.
+- Sidecar `.metadata.json` written alongside (Civitai version/file IDs +
+  provenance) so the next scan picks it up properly.
+- Sits next to `zImageTurbo_turbo.safetensors` (the existing base) — user
+  can pick either once C0 lands.
+
+### 14.4 — Honest scope revision: C0 deferred, C1 + C3 land today
+
+Z-Image Turbo's text encoder is a Qwen3-4B-like model (398 tensors,
+`model.embed_tokens` + `model.layers.0..N` with `q_proj/k_proj/v_proj/o_proj`
++ `gate_proj/up_proj/down_proj` + RMSNorm — classic Qwen2/3 architecture)
+with a custom 2560-dim projection feeding the ZImageTransformer2DModel
+(`cap_feat_dim=2560`). Building a clean Qwen3-backed text encoder loader +
+projection bridge is a substantial side-quest that doesn't actually unblock
+the Phase C deliverable ("no ComfyUI for cover art").
+
+**Decision**: ship C1 (endpoint) + C3 (Song Studio patch) today with
+**FLUX1 as the default cover backend** (already fully-wired, user runs it
+daily). Z-Image becomes task #57's follow-up — when it lands, switching the
+recommended backend is one env var (`KRAKEN_COVER_ARCH=z_image`). The
+downloaded GonzaLomo ZPop is already on disk and SHA-verified, waiting for
+the pipeline build that will light it up.
+
+### 14.5 — C1 landed: POST /api/cover-art (2026-05-23 19:50 UTC)
+
+Files modified:
+- **`python/api/cover_art.py`** (NEW, ~290 lines) — synchronous endpoint.
+  - `POST /api/cover-art` accepts `{prompt, aspect_ratio, arch_hint?,
+    song_dir?, song_id?, song_title?, seed?, negative?}` plus per-call
+    model overrides (`diffusion_model`, `vae`, `text_encoders`,
+    `checkpoint`, `steps`, `cfg`).
+  - Aspect-ratio buckets: `square` 1024², `portrait` 832×1216, `landscape`
+    1216×832 — matches Civitai/Suno conventions and FLUX-friendly
+    resolutions.
+  - Defaults discovered from `MODELS_ROOT` automatically:
+    - FLUX1: `Flux 1D FP16/fluxmania_kreamania.safetensors` + `ae` VAE +
+      `clip_l.safetensors` + `t5/t5xxl_fp16.safetensors`.
+    - SDXL: largest `.safetensors` under `checkpoints/` (note: imperfect —
+      LTX-video files there get picked; the SDXL fallback path requires an
+      explicit `checkpoint=` override in practice).
+    - Z-Image: returns HTTP 501 with a friendly pointer to task #57.
+  - Drives the existing `pipelines.flux.run()` / `pipelines.sdxl.run()`
+    via a synthetic `_InlineJob` (just enough of `jobs.Job` for them to
+    operate — `id`, `params`, `cancel: Event`, stub `progress`, `emit()`
+    that logs).
+  - When `song_dir` is provided, also writes the canonical
+    `<song_dir>/cover_art/cover.png` + `cover.json` manifest matching Song
+    Studio's existing readers (`latest_cover_art_image_path`,
+    `cover_art_state`) so the original cover-display path keeps working
+    transparently.
+  - `GET /api/cover-art/defaults` exposes what the endpoint would pick —
+    useful for a future Music-tab settings panel and for the Song Studio
+    launcher to print on startup ("cover-art backend: Kraken Art FLUX1 —
+    fluxmania_kreamania").
+- **`python/main.py`** — registered the new router under `/api`.
+
+Smoke test: module imports clean, `_flux_defaults()` returns the expected
+model picks, `_sdxl_defaults()` works (with the LTX-checkpoint caveat
+noted above), routes register under `/cover-art` + `/cover-art/defaults`.
+
+### 14.6 — C3 landed: Song Studio patch (2026-05-23 19:55 UTC)
+
+Files modified:
+- **`F:/Kraken_Audio/ACE-Step-1.5/acestep/codex_song_studio.py`**
+  (4887 → 5040 lines, +153 LOC, syntax-validated).
+  - Two new module-level helpers:
+    - `_kraken_cover_url()` → reads env `KRAKEN_COVER_URL` (e.g.
+      `http://127.0.0.1:7780`); empty string when unset.
+    - `_kraken_cover_arch_hint()` → reads env `KRAKEN_COVER_ARCH`,
+      defaults to `flux1`. Flip to `z_image` once task #57 lands.
+  - One new function: `run_cover_via_kraken_art(job_id, job)` — posts to
+    `<KRAKEN_COVER_URL>/api/cover-art` with the prompt + aspect + arch +
+    song_dir/id/title, then updates `COVER_ART_JOBS` in place using the
+    *exact same shape* the ComfyUI path uses, so existing readers
+    (`cover_art_state()`, the React `/api/covers/*` polling UI, the
+    `cover.json` manifest writer) work unchanged.
+  - Patched `run_cover_art_job_worker(job_id)`: after the initial
+    `mark_running` update, if `KRAKEN_COVER_URL` is set, route through the
+    new helper and return on success. Otherwise fall through to the
+    legacy ComfyUI path (intentional — keeps existing ComfyUI installs
+    working when the env var is unset).
+- Provenance fields in the cover.json manifest tag the Kraken-Art-sourced
+  covers explicitly: `kraken_art_arch`, `kraken_art_model`,
+  `workflow_name: "kraken-art:flux1"`, and `comfy_prompt_id` reused as
+  `"kraken-art {elapsed_s}s"` so the existing UI table still has a useful
+  third column.
+
+Backup before editing: original file copied to
+`backups/2026-05-23-1940-pre-phase-c-cover-art/codex_song_studio.py.original`.
+
+### 14.7 — How to flip the switch
+
+In Kraken_Audio's launcher (or directly in the shell that starts Song
+Studio on port 8010):
+
+```cmd
+set KRAKEN_COVER_URL=http://127.0.0.1:7780
+:: optional, defaults to flux1 today:
+set KRAKEN_COVER_ARCH=flux1
+```
+
+With those set and Kraken Art's sidecar running, hitting "Generate cover"
+in the Song Studio UI will round-trip through Kraken Art's FLUX1 stack,
+land a `cover.png` in the song's `cover_art/` folder + write a `cover.json`
+manifest that the same UI then displays.
+
+To revert: unset `KRAKEN_COVER_URL`. ComfyUI behaviour returns immediately.

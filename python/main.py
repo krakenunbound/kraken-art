@@ -47,6 +47,7 @@ from api.settings import router as settings_router
 from api.civitai import router as civitai_router
 from api.outputs import router as outputs_router
 from api.audio import router as audio_router
+from api.cover_art import router as cover_art_router
 
 app = FastAPI(title="Kraken Art Sidecar", version="0.1.0")
 
@@ -111,6 +112,7 @@ app.include_router(settings_router, prefix="/api")
 app.include_router(civitai_router,  prefix="/api")
 app.include_router(outputs_router,  prefix="/api")
 app.include_router(audio_router,    prefix="/api")   # Music / ACE-Step bridge
+app.include_router(cover_art_router, prefix="/api")  # Phase C: cover-art for Music tab + Song Studio
 app.include_router(progress_router)  # WebSocket path uses /ws/...
 
 
