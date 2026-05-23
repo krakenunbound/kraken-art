@@ -885,6 +885,51 @@ button.big { padding: 9px 22px; font-size: 14px; letter-spacing: 0.04em; }
   background: rgba(185, 67, 67, 0.85);
   border-color: #b94343;
 }
+.song-actions button.icon:hover {
+  background: rgba(0, 229, 255, 0.18);
+  border-color: rgba(0, 229, 255, 0.5);
+}
+.song-actions button.icon:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+/* ---- Bulk-export banner (Phase D) ---- */
+/* Sits above the song-grid while a bulk MP3 export is running. Becomes a
+   success/dismiss banner on completion. */
+.bulk-export-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  margin: 0 0 8px 0;
+  background: rgba(0, 229, 255, 0.10);
+  border: 1px solid rgba(0, 229, 255, 0.28);
+  border-radius: 5px;
+  font-size: 12px;
+  color: var(--fg, #e8e8e8);
+}
+.bulk-export-banner.finished {
+  background: rgba(80, 200, 120, 0.10);
+  border-color: rgba(80, 200, 120, 0.30);
+}
+.bulk-export-banner button {
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: var(--fg, #e8e8e8);
+  padding: 3px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.bulk-export-banner button:hover { background: rgba(255, 255, 255, 0.06); }
+.bulk-export-banner code {
+  background: rgba(0, 0, 0, 0.3);
+  padding: 1px 5px;
+  border-radius: 2px;
+  font-size: 11px;
+}
 
 .song-cover {
   width: 100%;

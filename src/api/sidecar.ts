@@ -226,6 +226,41 @@ export const songStreamUrl = (path: string) =>
 export const songDownloadUrl = (songId: string) =>
   `/api/audio/songs/${songId}/download`;
 
+// ---------- Phase D: MP3 export (LAME VBR V0 + embedded cover) ----------
+
+export type ExportMp3Result = {
+  ok: boolean;
+  song_id: string;
+  mp3_path: string;
+  mp3_url: string;
+  source_wav: string;
+  bitrate_avg_kbps: number;
+  size_bytes: number;
+  duration_seconds: number;
+  cover_embedded: boolean;
+  elapsed_s: number;
+};
+
+export type BulkExportMp3Result = { job_id: string; queued: number };
+
+/** Sync single-song export. Returns when the MP3 is on disk and tagged. */
+export const exportSongMp3 = (songId: string, opts: {
+  overwrite?: boolean;
+  title?: string;
+  artist?: string;
+  album?: string;
+  genre?: string;
+  comment?: string;
+} = {}) => postJSON<ExportMp3Result>(`/api/audio/songs/${songId}/export-mp3`, opts);
+
+/** Async bulk export. Returns a job_id immediately; subscribe via openJobWS. */
+export const exportSongsBulk = (songIds: string[], overwrite = false) =>
+  postJSON<BulkExportMp3Result>("/api/audio/songs/export-mp3", { song_ids: songIds, overwrite });
+
+/** Browser-download URL for an already-exported MP3 (most recent match). */
+export const exportedMp3DownloadUrl = (songId: string) =>
+  `/api/audio/songs/${songId}/export-mp3/download`;
+
 // ---------- Generation ----------
 
 export type LoraEntry = { name: string; weight: number };

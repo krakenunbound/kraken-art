@@ -30,6 +30,11 @@ websockets>=13
 pydantic>=2.9
 python-dotenv
 
+# ID3 tag writer for MP3 export (Phase D of the audio integration).
+# WAV→MP3 conversion itself uses ffmpeg via subprocess — that's a system
+# dependency, not a pip one. README documents the ffmpeg install.
+mutagen>=1.47
+
 # GPU detection / system
 psutil
 pynvml

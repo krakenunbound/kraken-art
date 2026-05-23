@@ -8,9 +8,13 @@ import {
   createPlaylist,
   createWorkspace,
   deleteSong as deleteSongApi,
+  exportSongMp3,
+  exportSongsBulk,
+  exportedMp3DownloadUrl,
   getAudioJob,
   getPlaylists,
   getSongLibrary,
+  openJobWS,
   type AudioHealth,
   type ModelListing,
   type Playlist,
@@ -84,6 +88,21 @@ export default function Music({ models, sidecar }: MusicProps) {
   const [currentTime, setCurrentTime] = useState(0);
   const [audioDuration, setAudioDuration] = useState(0);
   const [volume, setVolume] = useState(0.8);
+
+  // ---- MP3 export state (Phase D) ------------------------------------------
+  // singleExportBusy is keyed by song.id so multiple cards can show their own
+  // spinners (you can fire a row export while a bulk job is also running).
+  const [singleExportBusy, setSingleExportBusy] = useState<Set<string>>(new Set());
+  // Bulk export tracking — shows a banner above the grid with live progress.
+  type BulkProgress = {
+    jobId: string;
+    total: number;
+    done: number;
+    failed: number;
+    currentTitle: string;
+    finished: boolean;
+  };
+  const [bulkExport, setBulkExport] = useState<BulkProgress | null>(null);
 
   // ---- Song Studio health + model catalog ----------------------------------
   const [ssHealth, setSsHealth] = useState<SongStudioHealth | null>(null);
@@ -286,6 +305,96 @@ export default function Music({ models, sidecar }: MusicProps) {
       );
     } catch (e: any) {
       window.alert(`Create workspace failed: ${e?.message ?? e}`);
+    }
+  }
+
+  // ---- MP3 export handlers (Phase D) ---------------------------------------
+  // Single-song flow:
+  //   1. POST /api/audio/songs/{id}/export-mp3   — synchronous, returns the
+  //      result blob with mp3_url + size + bitrate + cover_embedded.
+  //   2. Open mp3_url in a new tab so the browser saves it (the endpoint
+  //      sets Content-Disposition: attachment, so it's a true download).
+  // Per-card spinner is keyed on song.id so simultaneous exports are fine.
+  async function onExportSingle(song: Song) {
+    if (singleExportBusy.has(song.id)) return;
+    setSingleExportBusy(prev => new Set(prev).add(song.id));
+    try {
+      const r = await exportSongMp3(song.id, { overwrite: false });
+      // Kick off the browser download via a synthetic <a download>. We use
+      // the dedicated download endpoint (not the mp3_url static file) so
+      // Content-Disposition is honoured even on browsers that prefer to
+      // open MP3s inline.
+      const a = document.createElement("a");
+      a.href = exportedMp3DownloadUrl(song.id);
+      a.download = `${song.title || song.id}.mp3`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Small toast-style alert with the useful facts. Could be a real
+      // toast component later; alert keeps this commit minimal.
+      window.alert(
+        `Exported "${song.title || song.id}":\n` +
+        `  ${Math.round(r.size_bytes / 1024)} KB at ${r.bitrate_avg_kbps} kbps (VBR V0)\n` +
+        `  Cover embedded: ${r.cover_embedded ? "yes" : "no"}\n` +
+        `  Encoded in ${r.elapsed_s}s`
+      );
+    } catch (e: any) {
+      window.alert(`Export failed for "${song.title || song.id}":\n${e?.message ?? e}`);
+    } finally {
+      setSingleExportBusy(prev => {
+        const next = new Set(prev);
+        next.delete(song.id);
+        return next;
+      });
+    }
+  }
+
+  // Bulk-export flow:
+  //   1. POST /api/audio/songs/export-mp3 with the selected IDs.
+  //   2. Subscribe to /ws/jobs/{job_id} for per-song progress + final summary.
+  // We render a small banner above the song grid with "8 of 30 exported".
+  async function onExportSelected() {
+    if (selectedIds.size === 0) return;
+    const ids = Array.from(selectedIds);
+    try {
+      const { job_id } = await exportSongsBulk(ids, false);
+      const initial: BulkProgress = {
+        jobId: job_id, total: ids.length, done: 0, failed: 0,
+        currentTitle: "", finished: false,
+      };
+      setBulkExport(initial);
+
+      const ws = await openJobWS(job_id);
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "bulk_progress") {
+            setBulkExport(prev => prev && ({
+              ...prev,
+              currentTitle: String(msg.message || "").replace(/^Exporting \d+\/\d+: /, ""),
+            }));
+          } else if (msg.type === "bulk_song_done") {
+            setBulkExport(prev => prev && ({ ...prev, done: prev.done + 1 }));
+          } else if (msg.type === "bulk_song_failed") {
+            setBulkExport(prev => prev && ({ ...prev, failed: prev.failed + 1 }));
+          } else if (msg.type === "status" && msg.status === "succeeded") {
+            setBulkExport(prev => prev && ({ ...prev, finished: true }));
+            ws.close();
+          } else if (msg.type === "status" && (msg.status === "failed" || msg.status === "cancelled")) {
+            setBulkExport(prev => prev && ({ ...prev, finished: true }));
+            ws.close();
+          }
+        } catch {
+          // Non-JSON frames (shouldn't happen) — ignore.
+        }
+      };
+      ws.onerror = () => {
+        // The WS may close before the job's final 'status' event reaches us
+        // (browser shutting it down, network blip). Don't change finished —
+        // a stale banner is better than a misleading "complete" claim.
+      };
+    } catch (e: any) {
+      window.alert(`Bulk export failed to start: ${e?.message ?? e}`);
     }
   }
 
@@ -589,6 +698,13 @@ export default function Music({ models, sidecar }: MusicProps) {
                     </div>
                   )}
                 </div>
+                <button
+                  onClick={onExportSelected}
+                  disabled={bulkBusy || (bulkExport !== null && !bulkExport.finished)}
+                  title="Export selected songs to MP3 (LAME VBR V0 + embedded cover)"
+                >
+                  Export MP3
+                </button>
                 <button onClick={onBulkDelete} disabled={bulkBusy} className="danger">
                   {bulkBusy ? "Deleting..." : "Delete"}
                 </button>
@@ -609,6 +725,31 @@ export default function Music({ models, sidecar }: MusicProps) {
           <div className="error-box">
             Library load failed: {libraryError}
             <button onClick={reloadLibrary} style={{ marginLeft: 8 }}>Retry</button>
+          </div>
+        )}
+
+        {bulkExport && (
+          <div className={"bulk-export-banner" + (bulkExport.finished ? " finished" : "")}>
+            {bulkExport.finished ? (
+              <>
+                <span>
+                  ✓ Exported {bulkExport.done} of {bulkExport.total}
+                  {bulkExport.failed > 0 && <> &nbsp;·&nbsp; {bulkExport.failed} failed</>}
+                </span>
+                <span className="muted small">
+                  Files in <code>outputs/exports/</code>
+                </span>
+                <button onClick={() => setBulkExport(null)}>Dismiss</button>
+              </>
+            ) : (
+              <>
+                <span>
+                  Exporting MP3s — {bulkExport.done + bulkExport.failed} of {bulkExport.total}
+                  {bulkExport.currentTitle && <> &nbsp;·&nbsp; <em>{bulkExport.currentTitle}</em></>}
+                </span>
+                <span className="muted small">VBR V0 (~240 kbps) with embedded cover</span>
+              </>
+            )}
           </div>
         )}
 
@@ -671,6 +812,14 @@ export default function Music({ models, sidecar }: MusicProps) {
                 </div>
 
                 <div className="song-actions" onClick={(e) => e.stopPropagation()}>
+                  <button
+                    title="Export to MP3 (LAME VBR V0 with embedded cover)"
+                    className="icon"
+                    onClick={() => onExportSingle(song)}
+                    disabled={singleExportBusy.has(song.id)}
+                  >
+                    {singleExportBusy.has(song.id) ? "…" : "⬇"}
+                  </button>
                   <button
                     title="Delete this song"
                     className="icon danger-ghost"

@@ -2,6 +2,48 @@
 
 Session-by-session record of what's landed.
 
+## 2026-05-23 (night) — Phase D: MP3 export (LAME VBR V0 + embedded cover)
+
+**Branch:** `feature/audio-integration`.
+**Pre-work tag:** `checkpoint/2026-05-23-2020-pre-phase-d-mp3-export`.
+**Post-work tag:** see git tag for hash.
+
+WAV→MP3 export for any song in the Music tab library, single or bulk. User
+preference (learned on a sibling project): **LAME `-V 0` VBR (~245 kbps avg)
+instead of CBR 320** — sidesteps two CBR pitfalls (wasted bits on silent
+frames + downstream mastering tools tripping on the 320 sentinel) while
+remaining sonically indistinguishable for ACE-Step-generated music.
+
+What landed:
+- `python/pipelines/audio/mp3_export.py` (NEW, ~280 lines) — ffmpeg
+  subprocess to `libmp3lame -q:a 0` for encode, mutagen for ID3v2.4 +
+  APIC cover embed. Tags: TIT2 (title), TPE1 (artist=workspaceTitle),
+  TALB (album), TCON (genre), COMM:prompt, TBPM, TKEY, USLT (full
+  lyrics), APIC (cover, type 3 = front).
+- `python/api/audio.py` — three new endpoints:
+  - `POST /api/audio/songs/{id}/export-mp3` (sync single)
+  - `GET /api/audio/songs/{id}/export-mp3/download` (browser download)
+  - `POST /api/audio/songs/export-mp3` (async bulk via JobManager + WS)
+- `python/requirements.txt` — `mutagen>=1.47` added.
+- `src/api/sidecar.ts` — `exportSongMp3`, `exportSongsBulk`, types.
+- `src/Music.tsx` — per-card `⬇` button + multi-select `Export MP3`
+  toolbar action + live progress banner (subscribes to /ws/jobs/{id}).
+- `src/App.css` — `.bulk-export-banner` + button hover states.
+
+Output layout: `outputs/exports/<workspace>/<title>.mp3`.
+
+Smoke-tested live: Salt And Dust (143.8 s WAV) → 6.9 MB MP3 @ 259 kbps
+avg, all ID3 frames written, cover embedded. file(1) confirms ID3v2.4 +
+MPEG layer III + variable bitrate. All three endpoints return 200 via
+TestClient.
+
+System dependency: **ffmpeg with libmp3lame** (already on the user's PATH
+from Gyan's Windows build, version 8.0.1). README will document this.
+
+Out of scope:
+- FLUX-speed experiments still uncommitted on disk.
+- Z-Image arch (task #57) — independent, not a Phase D blocker.
+
 ## 2026-05-23 (late evening, refine) — Phase C: lastGenerate as default + no more 501s
 
 **Commit:** (see git log for hash). **Tag:** `checkpoint/2026-05-23-XXXX-phase-c-refine` (to be applied this commit).

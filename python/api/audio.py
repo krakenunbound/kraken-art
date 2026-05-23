@@ -315,3 +315,224 @@ async def download_song_mp3(song_id: str):
             headers["Content-Disposition"] = f'attachment; filename="{song_id}.mp3"'
         media = r.headers.get("content-type", "audio/mpeg")
         return StreamingResponse(r.iter_bytes(), media_type=media, headers=headers)
+
+
+# ============================================================================
+# Phase D: MP3 export with embedded cover art (2026-05-23)
+# ============================================================================
+# WAV -> MP3 LAME VBR V0 + ID3v2.4 tags + APIC cover. The endpoint here
+# fetches the song full payload from Song Studio /api/library (so titles,
+# lyrics, cover paths are always fresh), then hands off to
+# pipelines.audio.mp3_export.export_song which does the actual ffmpeg call
+# + mutagen tag write. Returns a Kraken-Art-served URL the UI can hit to
+# trigger a browser download.
+#
+# Two endpoints:
+#   POST /api/audio/songs/{song_id}/export-mp3  -- synchronous, single song
+#   POST /api/audio/songs/export-mp3            -- async bulk via JobManager
+#                                                  (WS progress on /ws/jobs/{id})
+
+from fastapi.responses import FileResponse  # noqa: E402  -- intentional grouping
+
+
+def _find_song_in_library(library: dict, song_id: str) -> dict | None:
+    for s in (library.get("songs") or []):
+        if str(s.get("id")) == str(song_id):
+            return s
+    return None
+
+
+class ExportMp3Request(BaseModel):
+    overwrite: bool = False
+    # Optional metadata overrides. If a caller wants to tag the export with
+    # something other than what Song Studio knows about (e.g. a real artist
+    # name instead of the workspace title), pass them here.
+    title:      str | None = None
+    artist:     str | None = None
+    album:      str | None = None
+    genre:      str | None = None
+    comment:    str | None = None
+
+
+class ExportMp3Response(BaseModel):
+    ok: bool
+    song_id: str
+    mp3_path: str
+    mp3_url: str
+    source_wav: str
+    bitrate_avg_kbps: int
+    size_bytes: int
+    duration_seconds: float
+    cover_embedded: bool
+    elapsed_s: float
+
+
+@router.post("/songs/{song_id}/export-mp3", response_model=ExportMp3Response)
+async def export_song_mp3(song_id: str, req: ExportMp3Request = ExportMp3Request()) -> ExportMp3Response:
+    """Synchronous LAME VBR V0 export + cover embed for one song."""
+    client = get_default_song_studio_client()
+    try:
+        library = await client.library()
+    except Exception as e:
+        raise HTTPException(502, f"Song Studio library unreachable: {e}")
+
+    payload = _find_song_in_library(library, song_id)
+    if not payload:
+        raise HTTPException(404, f"Song {song_id!r} not found in Song Studio library.")
+
+    # Allow per-request metadata overrides without mutating Song Studio state.
+    if req.title:   payload["title"]           = req.title
+    if req.artist:  payload["workspaceTitle"]  = req.artist  # artist + album both pull from workspaceTitle
+    if req.album:   payload["workspaceTitle"]  = req.album
+    if req.genre:   payload["styleTags"]       = req.genre
+    if req.comment: payload["prompt"]          = req.comment
+
+    # Heavy ffmpeg work runs in a thread so we do not block the event loop.
+    import asyncio as _asyncio
+    from pipelines.audio.mp3_export import export_song
+
+    try:
+        result = await _asyncio.to_thread(export_song, song_payload=payload, overwrite=req.overwrite)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        # ffmpeg / mutagen friendly errors land here
+        raise HTTPException(500, str(e))
+
+    return ExportMp3Response(
+        ok=result.ok,
+        song_id=song_id,
+        mp3_path=result.mp3_path,
+        mp3_url=result.mp3_url,
+        source_wav=result.source_wav,
+        bitrate_avg_kbps=result.bitrate_avg_kbps,
+        size_bytes=result.size_bytes,
+        duration_seconds=result.duration_seconds,
+        cover_embedded=result.cover_embedded,
+        elapsed_s=result.elapsed_s,
+    )
+
+
+@router.get("/songs/{song_id}/export-mp3/download")
+async def download_exported_mp3(song_id: str):
+    """Stream the most-recent exported MP3 for this song with a
+    Content-Disposition attachment so the browser saves rather than plays.
+
+    The Music tab uses this two-step flow:
+      POST /api/audio/songs/{id}/export-mp3   -> {mp3_path, mp3_url, ...}
+      GET  the returned mp3_url               -> bytes for an <a download> link
+    """
+    client = get_default_song_studio_client()
+    try:
+        library = await client.library()
+    except Exception as e:
+        raise HTTPException(502, f"Song Studio library unreachable: {e}")
+    payload = _find_song_in_library(library, song_id)
+    if not payload:
+        raise HTTPException(404, f"Song {song_id!r} not found.")
+
+    from pipelines.audio.mp3_export import export_dir_for, _safe_filename
+    workspace = str(payload.get("workspaceTitle") or "").strip()
+    title = _safe_filename(str(payload.get("title") or "Untitled").strip())
+    out_dir = export_dir_for(workspace or None)
+    matches = sorted(out_dir.glob(f"{title}*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not matches:
+        raise HTTPException(
+            404,
+            "No export found for this song. POST /api/audio/songs/{id}/export-mp3 first.",
+        )
+    return FileResponse(
+        matches[0],
+        media_type="audio/mpeg",
+        filename=matches[0].name,
+    )
+
+
+class BulkExportMp3Request(BaseModel):
+    song_ids: list[str]
+    overwrite: bool = False
+
+
+class BulkExportMp3Response(BaseModel):
+    job_id: str
+    queued: int
+
+
+def _bulk_export_worker(job) -> dict:
+    """JobManager fn: export each song_id in sequence, emit progress, return summary."""
+    import asyncio as _asyncio
+    from pipelines.audio.mp3_export import export_song
+
+    p = job.params or {}
+    ids: list[str] = list(p.get("song_ids") or [])
+    overwrite: bool = bool(p.get("overwrite"))
+
+    job.progress.total_steps = len(ids)
+    job.progress.step = 0
+    job.emit({"type": "status", "message": f"Starting bulk export of {len(ids)} songs..."})
+
+    # Fetch library once up front so the bulk job is one network round trip
+    # rather than N. asyncio.run is fine here because we are inside a
+    # JobManager worker thread that has no running loop.
+    client = get_default_song_studio_client()
+    try:
+        library = _asyncio.run(client.library())
+    except Exception as e:
+        raise RuntimeError(f"Song Studio library unreachable: {e}")
+    by_id = {str(s.get("id")): s for s in (library.get("songs") or [])}
+
+    successes: list[dict] = []
+    failures: list[dict] = []
+
+    for i, sid in enumerate(ids):
+        if job.cancel.is_set():
+            break
+        job.progress.step = i + 1
+        payload = by_id.get(str(sid))
+        title = (payload or {}).get("title", sid)
+        job.emit({"type": "bulk_progress", "step": i + 1, "total": len(ids),
+                  "message": f"Exporting {i + 1}/{len(ids)}: {title}"})
+        if not payload:
+            failures.append({"song_id": sid, "error": "not in Song Studio library"})
+            continue
+        try:
+            r = export_song(song_payload=payload, overwrite=overwrite)
+            successes.append({
+                "song_id": sid,
+                "title": title,
+                "mp3_path": r.mp3_path,
+                "mp3_url": r.mp3_url,
+                "size_bytes": r.size_bytes,
+                "bitrate_avg_kbps": r.bitrate_avg_kbps,
+                "cover_embedded": r.cover_embedded,
+            })
+            job.emit({"type": "bulk_song_done", "song_id": sid, "title": title,
+                      "mp3_url": r.mp3_url, "size_bytes": r.size_bytes})
+        except Exception as e:
+            failures.append({"song_id": sid, "title": title, "error": str(e)})
+            job.emit({"type": "bulk_song_failed", "song_id": sid, "title": title,
+                      "error": str(e)})
+
+    return {
+        "kind": "mp3_export",
+        "requested": len(ids),
+        "succeeded": len(successes),
+        "failed": len(failures),
+        "outputs": successes,
+        "failures": failures,
+    }
+
+
+@router.post("/songs/export-mp3", response_model=BulkExportMp3Response)
+def export_songs_bulk(req: BulkExportMp3Request) -> BulkExportMp3Response:
+    """Bulk-export the listed song IDs. Returns a job_id immediately; the
+    UI subscribes to /ws/jobs/{id} for per-song progress and a final summary.
+    """
+    if not req.song_ids:
+        raise HTTPException(400, "song_ids must contain at least one song id.")
+    job = manager.submit(
+        kind="mp3_export",
+        params={"song_ids": req.song_ids, "overwrite": req.overwrite},
+        fn=_bulk_export_worker,
+    )
+    return BulkExportMp3Response(job_id=job.id, queued=len(req.song_ids))

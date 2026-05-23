@@ -835,3 +835,151 @@ Changes:
 Audit trail:
 - Pre-refine backup: `backups/2026-05-23-2005-pre-phase-c-refine/`
 - Pre-refine tag: `checkpoint/2026-05-23-2005-pre-phase-c-refine` (pushed)
+
+## 15. Phase D — MP3 export (LAME VBR V0 + embedded cover) (2026-05-23 20:35 UTC start)
+
+### 15.0 — Pre-work setup (2026-05-23 20:20 UTC)
+
+- Filesystem backup: `backups/2026-05-23-2020-pre-phase-d-mp3-export/`
+- Pre-work tag: `checkpoint/2026-05-23-2020-pre-phase-d-mp3-export` (pushed)
+- Branch state going in: `c5f6542` (Phase C refine)
+
+### 15.1 — Strategy & format decision
+
+User asked for "highest quality variable bit rate" instead of 320 CBR —
+learned on a sibling project that LAME `-V 0` (~245 kbps avg) sidesteps
+two CBR-320 pitfalls (silent frames wasting bits + downstream mastering
+tools tripping on the 320 sentinel) while being sonically
+indistinguishable for ACE-Step-generated music.
+
+Implementation: WAV→MP3 via **ffmpeg + libmp3lame -q:a 0** (subprocess),
+then mutagen for ID3v2.4 tags + APIC cover embed. No pure-Python encoder
+needed — ffmpeg is already on the user's PATH from Gyan's Windows build
+(verified version 8.0.1 with libmp3lame compiled in).
+
+### 15.2 — Source audio audit (2026-05-23 20:25 UTC)
+
+Song Studio's library entries reveal the actual format:
+- **Stored as WAV**, not MP3: e.g.
+  `F:\Kraken_Audio\ACE-Step-1.5\outputs\codex_song_studio\library\<ts>_<slug>\take-01.wav`
+- `masterPath` field on each song points at the canonical take
+- `folderPath` is the parent dir; cover art lives at
+  `<folderPath>/cover_art/cover.png` (Song Studio convention + the Kraken
+  Art Phase C side-effect writer's convention)
+- 364 songs total in the user's library
+
+So Phase D is real conversion work, not just a tagging pass.
+
+### 15.3 — C-level deliverables (2026-05-23 20:40 UTC)
+
+Files added:
+- **`python/pipelines/audio/mp3_export.py`** (NEW, ~280 lines) — the
+  conversion + tagging core. Public API: `export_song(song_payload,
+  overwrite=False)` returns an `ExportResult` dataclass. Constituent
+  functions:
+  - `encode_wav_to_mp3_vbr(src, dst)` — subprocess to
+    `ffmpeg -y -hide_banner -loglevel error -i <wav> -vn -codec:a
+    libmp3lame -q:a 0 -map_metadata -1 <mp3>`. The `-map_metadata -1`
+    drops WAV LIST chunks so mutagen's fresh ID3v2.4 block doesn't
+    conflict with an ID3v1 ffmpeg would otherwise emit.
+  - `write_id3_tags(mp3, ...)` — writes TIT2 (title), TPE1 (artist =
+    workspaceTitle), TALB (album), TCON (genre = styleTags), COMM:prompt
+    (truncated to 1500 chars), TBPM, TKEY, USLT (full lyrics), APIC
+    (cover, type 3 = Cover Front). Saves as ID3v2.4 + strips legacy v1.
+  - `_find_cover(folder)` — Song Studio's `cover_art/cover.{png,jpg,
+    jpeg,webp}` plus a last-ditch glob of any image in cover_art/.
+  - `_safe_filename(name, max_len=90)` — strips path separators + control
+    chars, collapses whitespace, caps length to keep us safely under
+    Windows' 260-char path limit even after the
+    `outputs/exports/<workspace>/` prefix.
+  - `export_dir_for(workspace)` — `outputs/exports/<workspace>/`,
+    auto-mkdir. Grouping by workspace keeps a bulk export from "Codex
+    gqom" from mingling with "Synthwave Mood" b-sides.
+
+- **`python/api/audio.py`** — three new endpoints appended:
+  - `POST /api/audio/songs/{song_id}/export-mp3` — synchronous, single
+    song. Body: `{overwrite?, title?, artist?, album?, genre?, comment?}`.
+    Heavy ffmpeg work runs in a thread via `asyncio.to_thread` so the
+    event loop stays free. Returns the full result blob (mp3_path,
+    mp3_url, bitrate_avg_kbps, size_bytes, cover_embedded, elapsed_s).
+  - `GET /api/audio/songs/{song_id}/export-mp3/download` — finds the
+    most-recent matching MP3 under
+    `outputs/exports/<workspace>/<title>*.mp3` and streams it with
+    `Content-Disposition: attachment` so the browser saves rather than
+    plays. Used by the per-card download flow.
+  - `POST /api/audio/songs/export-mp3` — bulk. Body:
+    `{song_ids: [...], overwrite}`. Returns `{job_id, queued}`
+    immediately; per-song progress flows out the existing
+    `/ws/jobs/{job_id}` WebSocket with `bulk_progress`,
+    `bulk_song_done`, `bulk_song_failed` event types. Final summary in
+    the job's `result` field on `status: succeeded`.
+
+- **`python/requirements.txt`** — `mutagen>=1.47` added; ffmpeg noted as
+  a documented system dependency (not pip).
+
+### 15.4 — UI deliverables (2026-05-23 20:50 UTC)
+
+Files modified:
+- **`src/api/sidecar.ts`** — `exportSongMp3`, `exportSongsBulk`,
+  `exportedMp3DownloadUrl` helpers + `ExportMp3Result` /
+  `BulkExportMp3Result` types.
+- **`src/Music.tsx`**:
+  - Per-card `⬇` action button next to the existing `✕` delete, with
+    per-song busy state so multiple exports can run simultaneously.
+    Triggers a browser download via a synthetic `<a download>` against
+    the dedicated download endpoint (Content-Disposition: attachment).
+  - Multi-select toolbar `Export MP3` button next to `Add to playlist`.
+    Posts to the bulk endpoint, then opens a WebSocket on
+    `/ws/jobs/{job_id}` and updates a small banner above the song grid
+    with "N of M exported" + the title currently being worked on. Banner
+    flips to a green "✓ Exported N of M" with a Dismiss button on
+    completion.
+- **`src/App.css`** — `.bulk-export-banner` (info + finished states) +
+  hover/disabled states for `.song-actions button.icon`.
+
+### 15.5 — Smoke test results
+
+Unit-level (direct call to `export_song()`):
+- Salt And Dust (143.83 s WAV) → 6.9 MB MP3, **259 kbps avg VBR**, all
+  ID3 frames (TIT2, TPE1, TALB, TBPM=114, TKEY="F Minor", TCON="gqom",
+  COMM:prompt, USLT:lyrics, APIC:cover-front), 1.37 s encode.
+- `file(1)` confirms: `Audio file with ID3 version 2.4.0, contains: MPEG
+  ADTS, layer III, v1, variable bitrate, 48 kHz, Stereo`.
+
+Endpoint-level (via FastAPI TestClient, no live sidecar restart needed):
+- `POST /api/audio/songs/{id}/export-mp3` returns 200 with full result
+  blob; produced Hold The Gate.mp3 at 256 kbps avg, cover embedded.
+- `GET .../export-mp3/download` returns 200 + audio/mpeg + correct
+  Content-Disposition (`attachment; filename*=utf-8''Hold%20The%20Gate.mp3`).
+- `POST /api/audio/songs/export-mp3` (bulk) returns 200 + job_id;
+  daemon-thread worker doesn't complete in TestClient because the
+  process exits before it runs — that's a test-harness artifact, not a
+  bug. Under a long-running sidecar (normal app launch), the daemon
+  thread stays alive for the duration of the job.
+
+TypeScript: `npx tsc --noEmit` clean for new code (two pre-existing
+TS6133 unused-var warnings in `src/App.tsx` left as-is per branch
+policy).
+
+### 15.6 — How to use
+
+In the running app (after restarting Kraken Art so the sidecar picks up
+the new code + the mutagen install):
+
+- **Single song**: hover a card → click `⬇` in the top-right corner.
+  Browser downloads `<title>.mp3` automatically; alert confirms size +
+  bitrate.
+- **Bulk**: select 1-N songs via the checkboxes → `Export MP3` in the
+  toolbar. Banner above the grid shows progress; files land in
+  `outputs/exports/<workspace>/<title>.mp3`.
+
+File layout:
+```
+outputs/exports/
+  Codex gqom/
+    Salt And Dust.mp3
+    Hold The Gate.mp3
+  Synthwave Mood/
+    Neon Rain Run.mp3
+  ...
+```
