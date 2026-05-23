@@ -983,3 +983,73 @@ outputs/exports/
     Neon Rain Run.mp3
   ...
 ```
+
+## 16. Launcher expansion for end-to-end testing (2026-05-23 21:10 UTC)
+
+User request: expand `Launch Kraken Art.bat` to cover all servers
+required for testing the audio integration, pre-check that none of them
+are lingering in memory before start, and wipe everything on close so
+nothing survives.
+
+Servers orchestrated:
+- Kraken Art Python sidecar (port 7780) — image generation + cover-art
+  + MP3 export endpoints
+- Kraken_Audio Codex Song Studio (port 8010) — Music tab library +
+  Song Studio cover-art worker
+- Kraken_Audio ACE-Step API (port 8001) — started transitively by the
+  Song Studio launcher; no separate handling needed
+
+New launcher flow (6 steps, visible in the console):
+
+1. **Pre-flight wipe** — `kill_port` helper kills any LISTENING PID on
+   each of 7780/8010/8001 with `taskkill /F /T`, then runs
+   `F:\Kraken_Audio\stop_kraken_services.ps1` (already present in
+   Kraken_Audio) which kills any process whose ExecutablePath or
+   CommandLine is rooted at `F:\Kraken_Audio\` — catches orphans the
+   port sweep misses.
+2. **Start Kraken_Audio stack** — `start "KrakenAudio-Stack" /min cmd /k
+   "call <AUDIO_LAUNCHER>"` opens a new minimized cmd that inherits two
+   env vars set just above it:
+     KRAKEN_COVER_URL  = http://127.0.0.1:7780
+     KRAKEN_COVER_ARCH = flux1
+   These are Song Studio's switch for Phase C — when set, its
+   `run_cover_art_job_worker` posts to Kraken Art instead of ComfyUI.
+   Polls port 8010 up to 180 s. If Song Studio fails to bind, the
+   launcher continues anyway (Music tab still loads existing library;
+   cover-art + MP3 export gracefully error).
+3. **Start Kraken Art sidecar** — exactly the same pattern the old .bat
+   used, but factored into the shared `wait_port` helper (max 90 s).
+4. **Summary** — prints the three health URLs.
+5. **Launch Tauri dev** — `npm run tauri dev`, blocking, until the user
+   closes the Kraken Art window.
+6. **Cleanup (always runs, no prompt)** — re-runs `kill_port` on all
+   three, re-runs `stop_kraken_services.ps1`, also closes the
+   minimized helper cmd windows by their titles
+   (KrakenArt-Sidecar, KrakenAudio-Stack, ACE-Step API), then
+   `verify_port_free` prints one line per port confirming it's released.
+
+Helper subroutines (DRY, idempotent, all in the same .bat):
+- `:kill_port <port> "<label>"` — netstat + taskkill + 1s settle.
+- `:wait_port <port> <max_seconds>` — polls every 2 s, prints
+  progress, returns exit code so `|| (...)` works on the call site.
+- `:verify_port_free <port> "<label>"` — single-line confirmation.
+
+Audit trail:
+- Pre-work backup: `backups/2026-05-23-2110-pre-launcher-expansion/`
+  (old `Launch Kraken Art.bat`)
+- Pre-work tag: `checkpoint/2026-05-23-2110-pre-launcher-expansion` (pushed)
+- New file: same path, ~218 lines.
+
+How to use for testing:
+1. Make sure both `F:\Kraken Art` and `F:\Kraken_Audio` repos are
+   present (audio launcher path is hardcoded — that matches the user's
+   actual install).
+2. Double-click `Launch Kraken Art.bat`.
+3. Wait for the green "All servers up" summary, then the Tauri window
+   pops.
+4. Test whatever you want.
+5. Close the Tauri window. Cleanup runs automatically — nothing
+   survives in memory.
+
+If you want to revert to the old per-port-7780-only behaviour:
+  git checkout checkpoint/2026-05-23-2110-pre-launcher-expansion -- "Launch Kraken Art.bat"
