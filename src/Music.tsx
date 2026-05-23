@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   addSongsToPlaylist,
   audioGenerate,
@@ -77,6 +77,13 @@ export default function Music({ models, sidecar }: MusicProps) {
   const [newPlaylistName, setNewPlaylistName] = useState("");
   const [creatingPlaylist, setCreatingPlaylist] = useState(false);
   const [addToPlaylistOpen, setAddToPlaylistOpen] = useState(false);
+
+  // ---- Persistent player bar state (B3) ------------------------------------
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [audioDuration, setAudioDuration] = useState(0);
+  const [volume, setVolume] = useState(0.8);
 
   // ---- Song Studio health + model catalog ----------------------------------
   const [ssHealth, setSsHealth] = useState<SongStudioHealth | null>(null);
@@ -296,6 +303,56 @@ export default function Music({ models, sidecar }: MusicProps) {
     } catch (e: any) {
       window.alert(`Delete failed: ${e?.message ?? e}`);
     }
+  }
+
+  // ---- Player bar (B3) -----------------------------------------------------
+  // Keep <audio>.volume in sync with the slider state. Native audio holds its
+  // own volume so we set it imperatively on the element ref.
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.volume = volume;
+  }, [volume]);
+
+  // When the active song changes, reset transport state and let the audio
+  // element kick off a new load. The autoPlay attribute on the element will
+  // start playback once loadedmetadata fires (browsers handle the rest).
+  useEffect(() => {
+    setCurrentTime(0);
+    setAudioDuration(0);
+    setPlaying(false);
+  }, [activeSong?.id]);
+
+  function togglePlayPause() {
+    const el = audioRef.current;
+    if (!el) return;
+    if (el.paused) {
+      el.play().catch(() => {});
+    } else {
+      el.pause();
+    }
+  }
+
+  function playPrev() {
+    if (!activeSong) return;
+    const idx = filtered.findIndex((s) => s.id === activeSong.id);
+    if (idx < 0) return;
+    const prev = filtered[(idx - 1 + filtered.length) % filtered.length];
+    setActiveSong(prev);
+  }
+  function playNext() {
+    if (!activeSong) return;
+    const idx = filtered.findIndex((s) => s.id === activeSong.id);
+    if (idx < 0) return;
+    const next = filtered[(idx + 1) % filtered.length];
+    setActiveSong(next);
+  }
+
+  function onSeek(e: React.ChangeEvent<HTMLInputElement>) {
+    const el = audioRef.current;
+    if (!el || !isFinite(audioDuration) || audioDuration <= 0) return;
+    const pct = parseFloat(e.target.value);
+    const t = (pct / 100) * audioDuration;
+    el.currentTime = t;
+    setCurrentTime(t);
   }
 
   // ---- ACE engine health (right-pane helper) -------------------------------
@@ -627,25 +684,6 @@ export default function Music({ models, sidecar }: MusicProps) {
           })}
         </div>
 
-        {/* Inline player (temporary — replaced by the persistent bottom bar in B3) */}
-        {activeSong && (() => {
-          const ap = firstAudioPath(activeSong);
-          return (
-            <div className="inline-player">
-              <div style={{ fontSize: 13, marginBottom: 4 }}>
-                <b>{activeSong.title || activeSong.id}</b>
-                <span className="muted small" style={{ marginLeft: 8 }}>
-                  {activeSong.workspaceTitle} · {fmtDuration(activeSong.duration)}
-                </span>
-              </div>
-              {ap ? (
-                <audio controls autoPlay src={songStreamUrl(ap)} style={{ width: "100%" }} />
-              ) : (
-                <div className="muted small">No playable audio file for this song.</div>
-              )}
-            </div>
-          );
-        })()}
       </main>
 
       {/* Right pane — generation form (unchanged behavior, scrollable) ----- */}
@@ -787,6 +825,107 @@ export default function Music({ models, sidecar }: MusicProps) {
           generates covers. Library views the same files Song Studio knows about.
         </div>
       </aside>
+
+      {/* Persistent player bar (B3) — position: fixed; bottom: 0 in CSS so it
+          floats over the rest of the page. Hidden when no song is active. */}
+      {activeSong && (() => {
+        const audioPath = firstAudioPath(activeSong);
+        const cover = coverUrl(activeSong);
+        const pct = audioDuration > 0 ? (currentTime / audioDuration) * 100 : 0;
+        const totalForDisplay = audioDuration > 0
+          ? audioDuration
+          : (activeSong.duration ?? 0);
+        return (
+          <div className="music-player-bar" role="region" aria-label="Now playing">
+            <div className="player-info">
+              <div className="player-cover">
+                {cover ? (
+                  <img src={cover} alt="" onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }} />
+                ) : (
+                  <div className="player-cover-fallback">♪</div>
+                )}
+              </div>
+              <div className="player-meta">
+                <div className="player-title" title={activeSong.title}>
+                  {activeSong.title || activeSong.id}
+                </div>
+                <div className="player-sub muted small">
+                  {activeSong.workspaceTitle || "—"}
+                </div>
+              </div>
+              <button
+                className="player-close"
+                title="Close player"
+                onClick={() => {
+                  audioRef.current?.pause();
+                  setActiveSong(null);
+                }}
+              >×</button>
+            </div>
+
+            <div className="player-transport">
+              <div className="transport-buttons">
+                <button onClick={playPrev} title="Previous" className="transport-btn">⏮</button>
+                <button onClick={togglePlayPause} title={playing ? "Pause" : "Play"} className="transport-btn play">
+                  {playing ? "⏸" : "▶"}
+                </button>
+                <button onClick={playNext} title="Next" className="transport-btn">⏭</button>
+              </div>
+              <div className="transport-scrubber">
+                <span className="transport-time">{fmtDuration(currentTime)}</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  value={pct}
+                  onChange={onSeek}
+                  disabled={!audioPath || audioDuration <= 0}
+                  className="transport-range"
+                />
+                <span className="transport-time">{fmtDuration(totalForDisplay)}</span>
+              </div>
+            </div>
+
+            <div className="player-volume">
+              <span className="muted small">🔊</span>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.01}
+                value={volume}
+                onChange={(e) => setVolume(parseFloat(e.target.value))}
+                className="volume-range"
+                title={`Volume: ${Math.round(volume * 100)}%`}
+              />
+            </div>
+
+            {/* Hidden controlled audio element — actual playback. */}
+            {audioPath && (
+              <audio
+                ref={audioRef}
+                src={songStreamUrl(audioPath)}
+                autoPlay
+                preload="auto"
+                onPlay={() => setPlaying(true)}
+                onPause={() => setPlaying(false)}
+                onEnded={() => { setPlaying(false); playNext(); }}
+                onTimeUpdate={(e) => setCurrentTime((e.target as HTMLAudioElement).currentTime)}
+                onLoadedMetadata={(e) => {
+                  const el = e.target as HTMLAudioElement;
+                  setAudioDuration(isFinite(el.duration) ? el.duration : 0);
+                  el.volume = volume;
+                }}
+                style={{ display: "none" }}
+              />
+            )}
+            {!audioPath && (
+              <div className="muted small player-noaudio">No playable audio for this song.</div>
+            )}
+          </div>
+        );
+      })()}
     </>
   );
 }

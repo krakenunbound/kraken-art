@@ -557,5 +557,91 @@ CHANGELOG.md will get one summary entry at the end of Phase B (after B3 lands), 
 
 **Intentionally deferred to B3:** persistent bottom player bar. Right now the inline player at the bottom of the center pane still does the job for playback.
 
-**Commit:** `<filled in below after commit>` on `feature/audio-integration`.
-**Tag:** `<filled in below after tag>`
+**Commit:** `a983ec8` on `feature/audio-integration`.
+**Tag:** `checkpoint/2026-05-23-1950-phase-b2-sidebar` (pushed).
+
+### 13.5 — B3 in progress: persistent player bar (2026-05-23 19:05 UTC)
+
+**Pre-work setup:**
+- Filesystem backup: `backups/2026-05-23-1905-pre-phase-b3-player-bar/` (Music.tsx + App.css)
+- Pre-work tag: `checkpoint/2026-05-23-1905-pre-phase-b3-player-bar` (pushed)
+- Branch state going in: at `a983ec8` (B2 complete)
+
+**Scope of B3:**
+- Replace the inline `<audio>` at the bottom of the center pane with a persistent player bar that's `position: fixed; bottom: 0` and spans the whole page width.
+- Bar layout (matches Suno + the user's Audio Studio screenshot bottom row):
+  - LEFT: cover thumbnail (40×40) + title + workspace meta
+  - CENTER: prev / play-pause / next + scrubber with timestamps (00:00 / 4:00)
+  - RIGHT: volume slider
+- prev/next navigates within the currently `filtered` list (visible songs), wrap-around.
+- Plays via a controlled `<audio ref={audioRef}>` so we can play/pause programmatically.
+- Hidden when no song is active.
+- z-index above log drawer; user can still close drawer or hide bar by clicking ✕ on the active song's card.
+
+**B3 landed (2026-05-23 19:10 UTC):**
+
+Files modified:
+- `src/Music.tsx` — inline `<audio>` removed from center pane; persistent
+  player-bar JSX moved out to a top-level sibling rendered after the right
+  `<aside>`. Added `useRef` import, player state (`audioRef`, `playing`,
+  `currentTime`, `audioDuration`, `volume`), two effects (sync `<audio>`
+  volume; reset transport state on song change) and handlers
+  (`togglePlayPause`, `playPrev`, `playNext`, `onSeek`). Controlled `<audio>`
+  element uses `autoPlay` + `preload="auto"` + `onLoadedMetadata` /
+  `onTimeUpdate` / `onEnded` so the rest of the bar is purely
+  presentational; native element owns playback state, React mirrors it.
+- `src/App.css` — appended ~210 lines of player-bar CSS:
+  `.music-player-bar` (position: fixed; bottom: 0; z-index: 100; grid
+  3-column layout); `.player-info` (cover + meta + close); `.player-cover`
+  (52×52 with `object-fit: cover`); `.player-meta` / `.player-title` /
+  `.player-sub` (ellipsis-truncated); `.player-transport` (centered prev /
+  play / next + scrubber); `.transport-btn.play` (accent-coloured 36×36
+  circular play button); `.transport-range` + `.volume-range` (custom
+  webkit/moz slider thumbs in accent colour); `.music-center` gets 88px
+  `padding-bottom` so the last row of the grid is never obscured by the
+  fixed bar.
+
+What works now:
+- Click any song card → player bar fades in at the bottom of the viewport
+  and starts playing automatically. Card gets `.active` outline.
+- Transport: prev / play-pause / next walk through whatever's currently in
+  the filtered grid (search + sidebar filter both honored, wraps at edges).
+- Scrubber: drag to seek; current + total time both shown as `mm:ss`.
+- Volume: 0–100% slider with state persisted across song changes (resets on
+  page reload — Phase D will persist it if asked).
+- Close ✕ on the bar pauses audio and unmounts it.
+- Onended → auto-advance to the next visible song (Suno-style autoplay).
+
+TypeScript: `npx tsc --noEmit` clean for new code (two pre-existing
+TS6133 unused-var warnings in `src/App.tsx` left as-is per branch policy).
+
+Commit: <pending — filled in next>
+Post-work tag: `checkpoint/2026-05-23-1910-phase-b3-player-bar`
+
+### 13.6 — Phase B summary (2026-05-23 19:10 UTC)
+
+Phase B is **complete**. All three increments (B1 grid, B2 sidebar, B3
+player bar) landed back-to-back, each with its own pre-work backup +
+pre-work tag + commit + post-work tag, satisfying the user's "document and
+back up as you go" directive verbatim.
+
+End-state of the Music tab:
+- Left pane: workspaces + playlists sidebar with All-songs / per-workspace
+  / per-playlist filters, inline playlist creation, workspace creation
+  hint, refresh.
+- Center pane: Suno-style cover grid (search + multi-select + bulk delete +
+  per-card delete + add-to-playlist dropdown + active highlight).
+- Right pane: existing Song Studio generation form (live model catalog
+  from Song Studio's `/api/config`, prompt + lyrics + cover toggle + BPM /
+  duration / temperature, job poll, ACE-Step health probe).
+- Bottom: fixed persistent player bar with cover, title, prev/play/next,
+  scrubber, volume, autoplay-next.
+
+Bench-relevant state untouched: no `python/pipelines/*` changes in this
+phase; FLUX-speed work remains intentionally uncommitted on disk.
+
+Next phases queued (not started):
+- **Phase C**: route Song Studio's cover-art calls through Kraken Art's
+  internal FLUX/SDXL instead of the dead ComfyUI dependency.
+- **Phase D**: MP3 320 kbps export with embedded cover art (verify Song
+  Studio's existing path + add a mutagen fallback inside the proxy).

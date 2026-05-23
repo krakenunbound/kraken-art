@@ -2,6 +2,48 @@
 
 Session-by-session record of what's landed.
 
+## 2026-05-23 (evening) — Phase B complete: Suno-style Music tab UI
+
+**Branch:** `feature/audio-integration`.
+**Tags:** `checkpoint/2026-05-23-1925-phase-b1-library-grid`,
+`checkpoint/2026-05-23-1950-phase-b2-sidebar`,
+`checkpoint/2026-05-23-1910-phase-b3-player-bar` (post-work, this commit).
+
+Three back-to-back commits (B1, B2, B3) rebuild the Music tab into the
+Suno-style workstation the user demonstrated with the Audio Studio
+screenshots — using only the Song Studio proxy endpoints landed in Phase A.
+Each increment shipped with its own pre-work filesystem backup +
+pre-work checkpoint tag + commit + post-work tag, per the user's
+"document and back up as you go" directive.
+
+- **B1** (`2678a5c`) — Suno-style library cover grid with search, multi-select,
+  bulk delete, per-card delete, inline player.
+- **B2** (`a983ec8`) — Left sidebar with workspaces (derived from library) +
+  playlists, All-songs filter, inline playlist creation, workspace-create
+  hint, refresh; "Add to playlist ▾" dropdown in the toolbar when songs
+  are selected.
+- **B3** (this commit) — Persistent bottom player bar (`position: fixed`)
+  with cover thumbnail, title, prev / play-pause / next (walks the
+  currently-filtered grid, wraps), draggable scrubber, volume slider,
+  autoplay-next on `<audio>` `ended`. Inline player removed from center
+  pane.
+
+Files touched in B3: `src/Music.tsx` (player state + effects + JSX moved to
+top-level sibling), `src/App.css` (+~210 lines of player-bar styling),
+`Documentation/Cursor-audio-adaption.md` (sections 13.5 result + 13.6 Phase
+B summary).
+
+TypeScript: clean for new code (two pre-existing TS6133 unused-var warnings
+in `App.tsx` left alone per branch policy).
+
+Out of scope (still uncommitted on disk, will land separately):
+FLUX-speed experiments and bench scripts — same list as the Phase A entry
+below.
+
+Next: Phase C (cover-art redirect from ComfyUI to Kraken Art FLUX/SDXL,
+task #55), then Phase D (MP3 320 kbps export verify + mutagen fallback,
+task #56).
+
 ## 2026-05-23 (afternoon) — Audio integration: Song Studio (port 8010) proxy
 
 **Commit:** `17b9fc1` on `feature/audio-integration`, pushed to GitHub.
