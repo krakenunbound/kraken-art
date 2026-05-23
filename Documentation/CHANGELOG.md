@@ -2,6 +2,35 @@
 
 Session-by-session record of what's landed.
 
+## 2026-05-23 (late evening, refine) — Phase C: lastGenerate as default + no more 501s
+
+**Commit:** (see git log for hash). **Tag:** `checkpoint/2026-05-23-XXXX-phase-c-refine` (to be applied this commit).
+
+User feedback after the Phase C ship: "use the current default Kraken Art
+model" — i.e. the endpoint should never return 501 for an unknown arch, it
+should fall through to whatever's actually working today and tell the
+caller what ran. Surgical refinement:
+
+- `python/api/cover_art.py`:
+  - `SUPPORTED_ARCHS = {"flux1", "sdxl"}` — the explicit set of archs with
+    a working pipeline today; new archs land here as they ship.
+  - New `_user_default_from_settings()` reads `config_store.lastGenerate`
+    so the cover endpoint picks exactly the model/VAE/TE combo the user
+    last used from the Generate tab.
+  - Param-build priority: explicit request field > user's `lastGenerate` >
+    auto-discovered default.
+  - `CoverArtResponse` now includes `requested_arch` + `arch` +
+    `requested_arch_unavailable` so the caller can show "asked for X, got
+    Y." Asking for `z_image` today returns a FLUX1 cover with
+    `requested_arch_unavailable=True` instead of HTTP 501.
+  - `/api/cover-art/defaults` now also returns `user_default` +
+    `supported_archs` + `fallback_policy` + `arch_coverage_gap_tracked_in`.
+
+Task #57 reframed: was "[Audio C0] Z-Image Turbo pipeline" (incorrectly
+framed as a Phase C dependency); now "[Image arch] Z-Image Turbo support
+(any model out of the box)" — sibling to task #11. Phase C never depended
+on it.
+
 ## 2026-05-23 (late evening) — Phase C: cover-art redirect (ComfyUI → Kraken Art)
 
 **Branch:** `feature/audio-integration`.

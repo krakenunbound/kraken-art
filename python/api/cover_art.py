@@ -47,10 +47,18 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+import config_store
 from config import MODELS_ROOT, OUTPUTS_ROOT
 
 log = logging.getLogger("kraken.cover_art")
 router = APIRouter()
+
+# The set of architectures that have a real, working pipeline backing them
+# today. `arch_hint` values outside this set are silently mapped to the
+# user's actual default (lastGenerate) or, failing that, FLUX1 — the
+# response always tells the caller what actually happened (`requested_arch`
+# vs `arch`) so this is never silent. New archs land here as they ship.
+SUPPORTED_ARCHS: set[str] = {"flux1", "sdxl"}
 
 
 # ----- aspect ratio → (width, height) ------------------------------------------------
@@ -128,6 +136,56 @@ def _sdxl_defaults() -> dict[str, Any]:
     }
 
 
+def _user_default_from_settings() -> dict[str, Any] | None:
+    """Read the user's last Generate-tab picks from config_store.lastGenerate.
+
+    This is what the user themselves chose the last time they hit Generate
+    in the Image tab — i.e. their *real* default, not whatever we'd guess.
+    Returns None when no lastGenerate is stored, or when the stored arch
+    isn't one we currently support a pipeline for (caller then falls
+    through to auto-discovered defaults for the closest supported arch).
+
+    Shape (matches src/api/sidecar.ts LastGenerate):
+      {archId: 'flux1'|'sdxl'|'z_image'|..., checkpoint, diffusionModel,
+       vae, te[], steps?, cfg?, ...}
+    """
+    try:
+        lg = config_store.get("lastGenerate", None)
+    except Exception:
+        return None
+    if not isinstance(lg, dict):
+        return None
+    arch = (lg.get("archId") or "").lower()
+    if not arch:
+        return None
+    if arch not in SUPPORTED_ARCHS:
+        # The user's *actual* default is an arch we can't render yet (e.g.
+        # z_image pending task #57). Caller logs `requested_arch_unavailable`
+        # and falls through to auto-discovered FLUX1 / SDXL.
+        return {"_unsupported_arch": arch}
+    out: dict[str, Any] = {"arch": arch}
+    if arch in ("sdxl", "illustrious"):
+        if lg.get("checkpoint"):
+            out["checkpoint"] = lg["checkpoint"]
+        out["steps"] = int(lg.get("steps") or 28)
+        out["cfg"]   = float(lg.get("cfg") or 7.0)
+    elif arch == "flux1":
+        if lg.get("diffusionModel"):
+            out["diffusion_model"] = lg["diffusionModel"]
+        if lg.get("vae"):
+            out["vae"] = lg["vae"]
+        te = lg.get("te") or []
+        if isinstance(te, list) and len(te) >= 2 and te[0] and te[1]:
+            out["text_encoders"] = [te[0], te[1]]
+        out["steps"] = int(lg.get("steps") or 28)
+        # FLUX defaults to CFG 1.0 per user feedback (distilled FLUX/Z-Image
+        # at CFG 1) — don't pick up the slider value if it accidentally
+        # stayed at SDXL's 7.0.
+        cfg = lg.get("cfg")
+        out["cfg"] = float(cfg) if cfg is not None else 1.0
+    return out
+
+
 # ----- request / response shapes -----------------------------------------------------
 
 class CoverArtRequest(BaseModel):
@@ -161,7 +219,13 @@ class CoverArtResponse(BaseModel):
     image_url: str
     width: int
     height: int
+    # Tells the caller exactly what was requested vs what actually ran.
+    # When they're different, an arch the caller asked for didn't have a
+    # working pipeline yet and we fell back to the user's current default.
+    # Never silent: the caller can show "FLUX1 (z_image not ready yet)".
+    requested_arch: str
     arch: str
+    requested_arch_unavailable: bool = False
     model: str | None
     elapsed_s: float
     song_dir_cover_path: str | None = None
@@ -261,33 +325,54 @@ def generate_cover_art(req: CoverArtRequest) -> CoverArtResponse:
         raise HTTPException(400, f"aspect_ratio must be one of {sorted(ASPECT_RATIOS.keys())}, got {req.aspect_ratio!r}.")
     width, height = ASPECT_RATIOS[aspect]
 
-    arch = req.arch_hint.lower()
-    if arch == "z_image":
-        # Honest scope: Z-Image text-encoder loader (Qwen3-4B with the custom
-        # 2560-dim projection) is task #57. The Civitai gonzalomoZpop_v40
-        # transformer is on disk and verified, but the pipeline wiring isn't
-        # ready yet. We refuse rather than silently down-grade to FLUX so the
-        # caller knows.
-        raise HTTPException(
-            501,
-            "Z-Image cover backend lands with task #57 (Phase C0 follow-up). "
-            "Use arch_hint='flux1' or 'sdxl' today.",
+    requested_arch = req.arch_hint.lower()
+    arch = requested_arch
+    requested_arch_unavailable = False
+
+    # Per the user's "use the current default" directive (2026-05-23 evening):
+    # if the caller asked for an arch we don't have a working pipeline for
+    # yet, silently fall through to the user's actual default in lastGenerate
+    # (or to auto-discovered FLUX1 if lastGenerate is empty). The response
+    # always tells the caller what actually ran, so this never lies.
+    if arch not in SUPPORTED_ARCHS:
+        user_default = _user_default_from_settings() or {}
+        actual_arch = user_default.get("arch")
+        if actual_arch in SUPPORTED_ARCHS:
+            arch = actual_arch
+        else:
+            arch = "flux1"
+        requested_arch_unavailable = True
+        log.warning(
+            "cover-art: arch_hint=%r is not yet supported; using arch=%r instead. "
+            "(arch coverage gap tracked in task #57 / task #11.)",
+            requested_arch, arch,
         )
+    else:
+        # Caller asked for a supported arch — but the user's lastGenerate may
+        # still be a more specific pick within that arch (e.g. they prefer a
+        # particular FLUX checkpoint or VAE). Layer that in below as a
+        # second-priority default beneath explicit request fields.
+        pass
 
     # Resolve model defaults + apply per-call overrides.
+    user_default = _user_default_from_settings() or {}
+    user_default_arch_matches = user_default.get("arch") == arch
+
     if arch == "sdxl":
         defaults = _sdxl_defaults()
+        ud = user_default if user_default_arch_matches else {}
         from pipelines import sdxl as image_pipeline
         params = {
             "arch":        "sdxl",
-            "checkpoint":  req.checkpoint or defaults["checkpoint"],
+            # Priority: explicit override > user's lastGenerate > auto-discovered.
+            "checkpoint":  req.checkpoint or ud.get("checkpoint") or defaults["checkpoint"],
             "vae":         req.vae,
             "prompt":      req.prompt,
             "negative":    req.negative,
             "width":       width,
             "height":      height,
-            "steps":       req.steps or defaults["steps"],
-            "cfg":         req.cfg or defaults["cfg"],
+            "steps":       req.steps or ud.get("steps") or defaults["steps"],
+            "cfg":         req.cfg or ud.get("cfg") or defaults["cfg"],
             "count":       1,
             "seed":        req.seed,
             "sampler":     "dpmpp_2m",
@@ -301,20 +386,22 @@ def generate_cover_art(req: CoverArtRequest) -> CoverArtResponse:
             )
         model_used = params["checkpoint"]
     else:
-        # flux1 default
+        # flux1 default (also where fall-through from unsupported archs lands)
         defaults = _flux_defaults()
+        ud = user_default if user_default_arch_matches else {}
         from pipelines import flux as image_pipeline
         params = {
             "arch":            "flux1",
-            "diffusion_model": req.diffusion_model or defaults["diffusion_model"],
-            "vae":             req.vae or defaults["vae"],
-            "text_encoders":   req.text_encoders or defaults["text_encoders"],
+            # Priority: explicit override > user's lastGenerate > auto-discovered.
+            "diffusion_model": req.diffusion_model or ud.get("diffusion_model") or defaults["diffusion_model"],
+            "vae":             req.vae or ud.get("vae") or defaults["vae"],
+            "text_encoders":   req.text_encoders or ud.get("text_encoders") or defaults["text_encoders"],
             "prompt":          req.prompt,
             "negative":        req.negative,
             "width":           width,
             "height":          height,
-            "steps":           req.steps or defaults["steps"],
-            "cfg":             req.cfg or defaults["cfg"],
+            "steps":           req.steps or ud.get("steps") or defaults["steps"],
+            "cfg":             req.cfg or ud.get("cfg") or defaults["cfg"],
             "count":           1,
             "seed":            req.seed,
         }
@@ -360,7 +447,9 @@ def generate_cover_art(req: CoverArtRequest) -> CoverArtResponse:
         image_url=image_url,
         width=width,
         height=height,
+        requested_arch=requested_arch,
         arch=arch,
+        requested_arch_unavailable=requested_arch_unavailable,
         model=model_used,
         elapsed_s=round(time.time() - t0, 1),
         song_dir_cover_path=song_dir_cover,
@@ -375,12 +464,15 @@ def cover_art_defaults() -> dict[str, Any]:
     print on launch ('cover-art backend: Kraken Art FLUX1 — fluxmania...').
     """
     return {
-        "aspect_ratios": ASPECT_RATIOS,
-        "flux1":         _flux_defaults(),
-        "sdxl":          _sdxl_defaults(),
-        "z_image": {
-            "status": "deferred",
-            "task":   "#57",
-            "note":   "gonzalomoZpop_v40.safetensors is downloaded and SHA-verified; pipeline wiring (Qwen3-4B text encoder) is the follow-up.",
-        },
+        "supported_archs": sorted(SUPPORTED_ARCHS),
+        "aspect_ratios":   ASPECT_RATIOS,
+        "user_default":    _user_default_from_settings(),  # what the Generate tab last used
+        "flux1":           _flux_defaults(),
+        "sdxl":            _sdxl_defaults(),
+        "fallback_policy": (
+            "If arch_hint isn't in supported_archs, fall back to user_default.arch "
+            "when supported, else flux1. Response always returns requested_arch + "
+            "actual arch so the caller can show 'asked for X, got Y'."
+        ),
+        "arch_coverage_gap_tracked_in": "task #11 + task #57 — Z-Image and others land per arch.",
     }

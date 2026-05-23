@@ -793,3 +793,45 @@ land a `cover.png` in the song's `cover_art/` folder + write a `cover.json`
 manifest that the same UI then displays.
 
 To revert: unset `KRAKEN_COVER_URL`. ComfyUI behaviour returns immediately.
+
+### 14.8 — Refinement: use user's actual default, no more 501s (2026-05-23 20:10 UTC)
+
+User feedback: "Whatever the current default kraken art model is, use that.
+Then later we can get all the various models to work for the art." Returning
+HTTP 501 on `arch_hint='z_image'` was the wrong shape — covers should always
+get made, with the response saying "you asked for X but I used Y."
+
+Changes:
+- **`python/api/cover_art.py`**:
+  - `SUPPORTED_ARCHS = {"flux1", "sdxl"}` — the explicit set of archs with
+    a working pipeline today. New archs get added here as they ship.
+  - `_user_default_from_settings()` — reads `config_store.lastGenerate`
+    (the user's most recent Generate-tab picks: archId + checkpoint or
+    diffusion_model+vae+te). Returns a normalized dict the endpoint slots
+    in between explicit request overrides and auto-discovered defaults.
+  - `requested_arch_unavailable` flag added to `CoverArtResponse`. When
+    `arch_hint` is outside `SUPPORTED_ARCHS`, we silently fall through to
+    the user's lastGenerate arch (if supported) or to FLUX1, log a
+    warning, and set this flag in the response so callers can show
+    "asked for z_image, got flux1 (z_image arch not wired yet)."
+  - The 501-on-z_image branch is gone. Asking for z_image gives you a
+    FLUX1 cover with `requested_arch="z_image"`, `arch="flux1"`,
+    `requested_arch_unavailable=True`.
+  - Param-build priority is now: **explicit request field > user's
+    `lastGenerate` > auto-discovered default**. So if the user has set up
+    a specific FLUX checkpoint + VAE + TE combo in the Generate tab, the
+    cover-art endpoint will pick exactly that combo — no surprises.
+  - `/api/cover-art/defaults` now also returns `user_default` (what
+    `lastGenerate` resolves to) + `supported_archs` + an explicit
+    `fallback_policy` string + `arch_coverage_gap_tracked_in` pointer.
+
+- **Task #57 reframed**: was "[Audio C0] Z-Image Turbo pipeline" (framed
+  as a Phase C dependency, which was wrong); now "[Image arch] Z-Image
+  Turbo support (any model out of the box)" — part of the same goal as
+  task #11 ("Phase 3: Image archs"). Phase C never depended on it; Phase
+  C ships with FLUX1 today and the user can still drop any FLUX1 / SDXL
+  checkpoint into the right folder and have it picked up.
+
+Audit trail:
+- Pre-refine backup: `backups/2026-05-23-2005-pre-phase-c-refine/`
+- Pre-refine tag: `checkpoint/2026-05-23-2005-pre-phase-c-refine` (pushed)
