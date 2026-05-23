@@ -78,6 +78,8 @@ export type ModelEntry = { name: string; filename: string; subdir: string; abs_p
 export type ModelListing = {
   root: string;
   exists: boolean;
+  audio_ace_root?: string;
+  audio_ace_exists?: boolean;
   categories: Record<string, ModelEntry[]>;
   counts: Record<string, number>;
 };
@@ -89,6 +91,35 @@ export const getGpu         = () => getJSON<GpuInfo>("/api/gpu");
 export const getDeps        = () => getJSON<DepsStatus>("/api/deps");
 export const getModels      = () => getJSON<ModelListing>("/api/models");
 export const refreshModels  = () => postJSON<{ refreshed: boolean; counts: Record<string, number> }>("/api/models/refresh");
+
+// ---------- Audio (ACE-Step bridge) ----------
+export type AudioHealth = { ok: boolean; detail: any };
+export const audioHealth = () => getJSON<AudioHealth>("/api/audio/health");
+export const audioModels = () => getJSON<any>("/api/audio/models");
+
+export interface AudioGeneratePayload {
+  prompt?: string;
+  lyrics?: string;
+  ace_model?: string | null;
+  bpm?: number;
+  key_scale?: string;
+  duration?: number;
+  temperature?: number;
+  generate_cover?: boolean;
+  cover_prompt?: string | null;
+  thinking?: boolean;
+  sample_mode?: boolean;
+}
+
+export const audioGenerate = (payload: AudioGeneratePayload) =>
+  postJSON<{ job_id: string; status: string; kind: string }>("/api/audio/generate", payload);
+
+export const getAudioJob = (jobId: string) => getJSON<any>(`/api/audio/jobs/${jobId}`);
+export const cancelAudioJob = (jobId: string) =>
+  postJSON<any>(`/api/audio/jobs/${jobId}/cancel`, {});
+
+export const audioFileUrl = (absPath: string) =>
+  `/api/audio/file?path=${encodeURIComponent(absPath)}`;  // relative to the sidecar — works in Tauri webview
 
 // ---------- Generation ----------
 
@@ -174,12 +205,33 @@ export type Settings = {
   };
 };
 
+// Shape saved by the Generate tab so the user's last choices are restored on next launch.
+export interface LastGenerate {
+  archId?: string;
+  checkpoint?: string;
+  diffusionModel?: string;
+  vae?: string;
+  te?: string[];
+  prompt?: string;
+  negative?: string;
+  w?: number;
+  h?: number;
+  steps?: number;
+  cfg?: number;
+  sampler?: string;
+  scheduler?: string;
+}
+
 export const getSettings   = () => getJSON<Settings>("/api/settings");
 export const patchSettings = (patch: Partial<{
   civitai: Partial<Settings["civitai"]>;
   downloads: Partial<Settings["downloads"]>;
   performance: Partial<Settings["performance"]>;
+  lastGenerate?: LastGenerate | null;
 }>) => patchJSON<Settings>("/api/settings", patch);
+
+export const saveLastGenerate = (data: LastGenerate) =>
+  patchSettings({ lastGenerate: data });
 
 // ---------- Civitai ----------
 

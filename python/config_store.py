@@ -46,7 +46,23 @@ DEFAULTS: dict[str, Any] = {
         # `off` / `auto` (default) = skip compile.
         # See Documentation/FLUX-SPEED-WIP.md.
         "flux_compile": "off",
+        # First Block Cache via para-attn. Skip the heavy transformer forward
+        # for steps where the residual between consecutive sampling steps is
+        # below `flux_fbcache_threshold`. Measured 2026-05-22: NET NEGATIVE
+        # when combined with our streaming offload (10-50 s/step vs 2 s/step
+        # baseline) because FBCache's residual cache buffers + streaming's
+        # pinned weights both contend for the same activation VRAM budget.
+        # ComfyUI uses FBCache without streaming (their FLUX auto-FP8 fits).
+        # Off by default; opt-in only when fast-mode (no streaming) is active.
+        # See Documentation/FLUX-SPEED-WIP.md.
+        "flux_fbcache": "off",
+        "flux_fbcache_threshold": 0.08,
     },
+
+    # Automatically saved by the frontend (Generate tab) so the last
+    # generation setup is restored on next launch. Only model-related fields
+    # are restored if the files still exist in the current scan.
+    "lastGenerate": None,
 }
 
 _lock = threading.Lock()

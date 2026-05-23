@@ -6,9 +6,10 @@ import Library from "./Library";
 import Logs from "./Logs";
 import SettingsModal from "./Settings";
 import { clearMemory, getDeps, getGpu, getLogs, getModels, getSettings, health, refreshModels, type DepsStatus, type GpuInfo, type Health, type ModelListing, type Settings } from "./api/sidecar";
+import Music from "./Music";
 import { listen } from "@tauri-apps/api/event";
 
-type Tab = "image" | "library";
+type Tab = "image" | "library" | "music";
 
 type Status = "checking" | "up" | "down";
 
@@ -166,6 +167,7 @@ export default function App() {
         <nav className="tab-strip">
           <button className={"tab " + (tab === "image" ? "active" : "")} onClick={() => setTab("image")}>Image</button>
           <button className={"tab " + (tab === "library" ? "active" : "")} onClick={() => setTab("library")}>Library</button>
+          <button className={"tab " + (tab === "music" ? "active" : "")} onClick={() => setTab("music")}>♪ Music</button>
         </nav>
         {sidecarPill}
         {gpuPill}
@@ -240,8 +242,11 @@ export default function App() {
 
         {/* Image tab renders BOTH center + right pane as siblings of the left aside.
             Library tab renders a single center pane (no right). */}
-        {tab === "image" && <Generate models={models} />}
+        {tab === "image" && <Generate models={models} settings={settings} />}
         {tab === "library" && <Library settings={settings} onModelsChanged={doRefresh} />}
+        {tab === "music" && <Music models={models} sidecar={sidecar} />}
+
+              $3
       </div>
 
       <Logs open={logsOpen} onClose={() => { setLogsOpen(false); setLogBadge(0); }} />

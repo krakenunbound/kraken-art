@@ -5,10 +5,13 @@ import {
   deleteOutputs,
   openJobWS,
   outputFileUrl,
+  saveLastGenerate,
   startGenerate,
   type GenerateParams,
+  type LastGenerate,
   type LoraEntry,
   type ModelListing,
+  type Settings,
 } from "./api/sidecar";
 
 const DIM_PRESETS: Array<[string, number, number]> = [
@@ -169,7 +172,13 @@ const ARCH_PROFILES: ArchProfile[] = [
 
 type Preview = { idx: number; b64: string; seed: number; filename: string; rel_path: string };
 
-export default function Generate({ models }: { models: ModelListing | null }) {
+export default function Generate({
+  models,
+  settings,
+}: {
+  models: ModelListing | null;
+  settings?: Settings | null;
+}) {
   const checkpoints   = models?.categories.checkpoints      ?? [];
   const diffusion     = models?.categories.diffusion_models ?? [];
   const vaes          = models?.categories.vae              ?? [];
@@ -223,6 +232,100 @@ export default function Generate({ models }: { models: ModelListing | null }) {
     if (profile.mode === "checkpoint" && !checkpoint && checkpoints.length) setCheckpoint(checkpoints[0].name);
     if (profile.mode === "components" && !diffusionModel && diffusion.length) setDiffusionModel(diffusion[0].name);
   }, [profile.mode, checkpoints, diffusion, checkpoint, diffusionModel]);
+
+  // ---------- Last-used persistence (remember what the user had selected) ----------
+  const restoreDoneRef = useRef(false);
+  const saveTimeoutRef = useRef<number | null>(null);
+
+  function scheduleSave() {
+    if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+    saveTimeoutRef.current = window.setTimeout(() => {
+      const snapshot: LastGenerate = {
+        archId,
+        checkpoint: checkpoint || undefined,
+        diffusionModel: diffusionModel || undefined,
+        vae: vae || undefined,
+        te: te.length ? [...te] : undefined,
+        prompt: prompt || undefined,
+        negative: negative || undefined,
+        w,
+        h,
+        steps,
+        cfg,
+        sampler,
+        scheduler,
+      };
+      // Fire and forget
+      saveLastGenerate(snapshot).catch(() => {});
+    }, 650); // debounce a bit so we don't spam on every keystroke
+  }
+
+  // Restore from lastGenerate the first time we have both models and settings
+  useEffect(() => {
+    if (restoreDoneRef.current) return;
+    if (!models || !settings?.lastGenerate) return;
+
+    const lg = settings.lastGenerate;
+    let didRestore = false;
+
+    // Helper to check if a name still exists in the current scan
+    const existsIn = (cat: string, name?: string) =>
+      !!name && (models.categories[cat] ?? []).some((m) => m.name === name);
+
+    if (lg.archId && ARCH_PROFILES.some((p) => p.id === lg.archId)) {
+      setArchId(lg.archId);
+      didRestore = true;
+    }
+
+    if (lg.checkpoint && existsIn("checkpoints", lg.checkpoint)) {
+      setCheckpoint(lg.checkpoint);
+      didRestore = true;
+    }
+    if (lg.diffusionModel && existsIn("diffusion_models", lg.diffusionModel)) {
+      setDiffusionModel(lg.diffusionModel);
+      didRestore = true;
+    }
+    if (lg.vae && existsIn("vae", lg.vae)) {
+      setVae(lg.vae);
+      didRestore = true;
+    }
+    if (lg.te?.length) {
+      // Only keep entries that still exist
+      const valid = lg.te.filter((name) => existsIn("text_encoders", name));
+      if (valid.length) {
+        setTe(valid);
+        didRestore = true;
+      }
+    }
+
+    if (typeof lg.prompt === "string") { setPrompt(lg.prompt); didRestore = true; }
+    if (typeof lg.negative === "string") { setNegative(lg.negative); didRestore = true; }
+    if (typeof lg.w === "number" && lg.w > 0) { setW(lg.w); didRestore = true; }
+    if (typeof lg.h === "number" && lg.h > 0) { setH(lg.h); didRestore = true; }
+    if (typeof lg.steps === "number") { setSteps(lg.steps); didRestore = true; }
+    if (typeof lg.cfg === "number") { setCfg(lg.cfg); didRestore = true; }
+    if (lg.sampler) { setSampler(lg.sampler); didRestore = true; }
+    if (lg.scheduler) { setScheduler(lg.scheduler); didRestore = true; }
+
+    if (didRestore) {
+      // mark that we restored so the next change effects don't immediately overwrite with old values
+      restoreDoneRef.current = true;
+    }
+  }, [models, settings]); // run when both become available
+
+  // Whenever key fields change *after* restore, schedule a save
+  useEffect(() => {
+    if (!restoreDoneRef.current) return; // don't save the initial auto-pick or the restore itself
+    scheduleSave();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [archId, checkpoint, diffusionModel, vae, JSON.stringify(te), prompt, negative, w, h, steps, cfg, sampler, scheduler]);
+
+  // Cleanup any pending save timer on unmount
+  useEffect(() => {
+    return () => {
+      if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+    };
+  }, []);
 
   // Auto-detect arch + tune CFG/steps + auto-fill VAE / text encoders when the
   // user changes the primary model file. Filename-pattern heuristics.
