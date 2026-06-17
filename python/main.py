@@ -116,7 +116,27 @@ app.include_router(cover_art_router, prefix="/api")  # Phase C: cover-art for Mu
 app.include_router(progress_router)  # WebSocket path uses /ws/...
 
 
+@app.on_event("shutdown")
+def _stop_audio_engines_on_shutdown() -> None:
+    """Kill any audio engine subprocess the sidecar spawned so they don't orphan
+    when the app exits (the sidecar owns their lifecycle)."""
+    try:
+        from pipelines.audio.engine_manager import manager as audio_engines
+        audio_engines.stop_all()
+    except Exception:
+        pass
+    try:
+        from pipelines.audio import song_studio_service
+        song_studio_service.stop()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     import uvicorn
     OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
-    uvicorn.run("main:app", host=SIDECAR_HOST, port=SIDECAR_PORT, log_level="info")
+    # Pass the app OBJECT, not the "main:app" import string. The string form makes
+    # uvicorn re-import this module (it's already running as __main__), which
+    # re-runs startup and logs "sidecar starting" a second time — the confusing
+    # double line in the logs. No reload/workers here, so the object is correct.
+    uvicorn.run(app, host=SIDECAR_HOST, port=SIDECAR_PORT, log_level="info")

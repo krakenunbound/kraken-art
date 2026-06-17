@@ -917,8 +917,21 @@ def _run_with_persistent_worker(job) -> dict:
 
 
 def run(job) -> dict:
-    """Run Ideogram in a child process so CUDA hard-crashes do not kill FastAPI."""
-    if os.environ.get("KRAKEN_IDEOGRAM4_INPROCESS") == "1":
+    """Run Ideogram. DEFAULT IS IN-PROCESS.
+
+    Hard-won lesson (2026-06-17): the subprocess worker was added to isolate
+    CUDA crashes, but on Windows it CAUSES them. The sidecar process holds a
+    CUDA context (the GPU panel calls torch.cuda; FLUX/SDXL also use CUDA in
+    this process). When it then spawns a child worker that does bitsandbytes
+    4-bit weight construction on the SAME GPU, the child dies with a fatal
+    Windows access violation (exit 0xC0000005) at the bnb Linear4bit build —
+    reproduced deterministically. Running in-process keeps a single CUDA
+    context, which bitsandbytes handles normally, so it just works.
+
+    The worker remains available for deliberate isolated experimental-quant
+    testing via KRAKEN_IDEOGRAM4_USE_WORKER=1.
+    """
+    if os.environ.get("KRAKEN_IDEOGRAM4_USE_WORKER") != "1":
         return _run_inprocess(job)
 
     from pipelines import flux as flux_mod, sdxl as sdxl_mod, wan_video as wan_mod, z_image as zi_mod
