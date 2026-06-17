@@ -641,3 +641,115 @@ first is just the ~1.9 min.
 adaptive cache, High mode) — a ~7.5× speedup, under the 3-min ideal. Fast mode
 ~1.6 min for drafts; Max mode 4.3 min for the purist reference. Bigger final
 images via generate-at-1MP-then-upscale (native 2K spills; don't).
+
+---
+
+# CAVEAT — shared VRAM (2026-06-17)
+
+The speed numbers above (NF4 fits at 22.3 GB peak; ~2.0 min High mode) were
+measured on a near-idle 24 GB card. In normal use the 3090's VRAM is shared
+with the Kraken app itself and with other concurrent GPU work (e.g. a Codex
+D&D-campaign assistant). If free VRAM drops below ~2.5 GB while an Ideogram
+job runs, NF4 can tip into Windows shared-memory spill and slow down
+sharply — the same mechanism that caused the original 15 min. Practical
+guidance: treat the benchmark numbers as best-case; for guaranteed fast runs,
+make sure the card is mostly free (the launcher's engine-wipe + the persistent
+worker help). The "fit in 24 GB" work matters MORE under contention, not less.
+A future hardening step: have the Ideogram worker check free VRAM before a job
+and, if low, fall back to NF4-with-text-encoder-offload (frees ~5–8 GB) so it
+still fits.
+
+---
+
+# MAGIC PROMPT — how it works + what we can improve (2026-06-17 research)
+
+## The key nuance most people miss
+
+There are TWO different prompt worlds for Ideogram 4:
+
+1. **Cloud Ideogram (ideogram.ai):** you type plain **natural language**
+   (~150–160 words is the sweet spot; quotes for in-image text; no weights,
+   no `--ar`, no hex codes). "Magic Prompt = On/Auto" then runs Ideogram's
+   server-side LLM that rewrites your short idea into a long, cinematic "hero
+   prompt" (subject → environment → camera/lighting → textures). You never see
+   the expansion; it just happens.
+
+2. **Local open-weights (what Kraken runs):** the model was trained on a
+   **structured JSON caption** — `high_level_description` +
+   `compositional_deconstruction` (a `background` plus an `elements` list with
+   `bbox` coordinates on a 0–1000 grid, and `text` elements carrying the exact
+   in-image string). The local inference package literally validates this
+   schema. So locally, the JSON **is** the model's native language; the
+   "magic" is converting human intent into a great JSON caption.
+
+So "magic prompt" = automatic prompt expansion. On the cloud it's an LLM.
+Locally there's no LLM doing it for you unless you provide one.
+
+## What Kraken has today (python/pipelines/ideogram4_magic.py)
+
+A **deterministic, rule-based** JSON builder (no LLM, no VRAM). It:
+- detects photo vs art by keyword lists,
+- has a few hardcoded style branches (gothic / beach-70s / mouse-children /
+  logo-poster / default),
+- pulls quoted text into `text` elements with computed bboxes,
+- emits the `high_level_description` + `style_description` +
+  `compositional_deconstruction` JSON.
+Plus an `api` mode (calls a hosted magic-prompt endpoint if an OpenRouter/
+Ideogram key is set) and a `raw` passthrough (used when you paste JSON yourself).
+
+It works, but the expansion is shallow — fixed branches, generic filler. It's a
+floor, not a ceiling.
+
+## The honest quality model
+
+For the LOCAL model, **image quality is gated by the quality of the JSON
+caption.** A rich, well-structured caption beats a thin one every time. So the
+whole game is: produce the best JSON. Three ways, in order of output quality:
+
+1. **A frontier LLM writes the JSON** (Claude / GPT / Gemini / Grok) — best
+   results, because these models are far better art directors than any rule
+   engine or small local model. This is exactly the user's current habit
+   (copy-paste from an external LLM).
+2. **A small local LLM writes the JSON** — replicates cloud magic prompt
+   offline, but costs VRAM/complexity and is weaker than frontier models.
+3. **Deterministic builder** (current) — instant, offline, free, but shallow.
+
+## Recommended improvements (priority order, VRAM-aware)
+
+Given the shared-VRAM constraint, do NOT add a local LLM that competes with the
+image model for the 24 GB. Instead:
+
+**P1 — BYO-LLM bridge (highest leverage, zero image-time VRAM).**
+Add an optional "expand with LLM" that calls the user's chosen API (Claude /
+OpenRouter / or Song Studio's already-running assistant on :8010) with a
+curated Ideogram system prompt, returns a validated JSON caption, and fills the
+prompt box. This replicates cloud magic prompt using a *frontier* model, runs
+before the image model loads, and uses no local VRAM. Reuses the existing
+`ideogram_magic_mode = "api"` plumbing.
+
+**P2 — A copyable "Ideogram JSON system prompt" + paste-and-validate.**
+Ship a battle-tested system prompt in the UI (one click "Copy") so the user can
+paste it into Claude/ChatGPT/Grok, get perfect JSON, paste it back — and a
+"Format / validate" button that checks the JSON against the schema and fixes
+common issues (missing fields, bad bbox ranges, smart-quotes). Zero infra;
+directly upgrades the user's existing copy-paste workflow.
+
+**P3 — Enhance the deterministic builder into a "slot machine."**
+Add structured pickers — Style / Lighting / Camera / Mood / Composition — backed
+by curated phrase libraries drawn from Ideogram's own prompting guide (concrete
+visual grounding: "deep red", "golden hour", "35mm film", "volumetric light",
+"shallow depth of field"). Build the JSON from picks + free-text subject, target
+~150–160 words. Offline fallback when no LLM is configured; much stronger than
+the current 5 hardcoded branches.
+
+**P4 — Template gallery** from EvoLinkAI/awesome-ideogram-4.0-prompts (poster,
+product packaging, portrait, typography, brand-system). Curated proven captions
+the user picks and fills — instant good results, teaches the format by example.
+
+## Sources
+- Ideogram Magic Prompt: https://docs.ideogram.ai/using-ideogram/generation-settings/magic-prompt
+- Prompting fundamentals: https://docs.ideogram.ai/using-ideogram/prompting-guide/2-prompting-fundamentals
+- Example prompts: https://github.com/EvoLinkAI/awesome-ideogram-4.0-prompts
+- User-provided notes: Downloads/"is it possible without A.I. to create a prompt ge....md"
+  (deterministic slot-machine builder) + Downloads/"https___docs.ideogram.ai_…md"
+  (4-pillar expansion blueprint).
