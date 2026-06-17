@@ -64,6 +64,8 @@ export type GpuInfo = {
   name: string | null;
   vram_total_mb: number | null;
   vram_free_mb: number | null;
+  gpu_utilization_percent: number | null;
+  gpu_temperature_c: number | null;
   driver: string | null;
   cuda_runtime: string | null;
   cuda_available: boolean;
@@ -74,7 +76,32 @@ export type GpuInfo = {
 export type DepPackage = { name: string; required: string; installed: string | null; ok: boolean; remedy: string | null };
 export type DepsStatus = { all_ok: boolean; missing: number; packages: DepPackage[] };
 
-export type ModelEntry = { name: string; filename: string; subdir: string; abs_path: string; size_bytes: number; ext: string };
+export type ModelEntry = {
+  name: string;
+  filename: string;
+  subdir: string;
+  abs_path: string;
+  size_bytes: number;
+  ext: string;
+  base_model?: string | null;
+  source_type?: string | null;
+  detected_arch?: string | null;
+  experimental?: boolean | null;
+  disabled_by_default?: boolean | null;
+  warning?: string | null;
+  recommended_settings?: {
+    cfg?: number;
+    cfg_range?: [number, number];
+    steps?: number;
+    steps_range?: [number, number];
+    width?: number;
+    height?: number;
+    resolutions?: [number, number][];
+    sampler?: string;
+    scheduler?: string;
+    source?: string;
+  } | null;
+};
 export type ModelListing = {
   root: string;
   exists: boolean;
@@ -98,12 +125,14 @@ export const audioHealth = () => getJSON<AudioHealth>("/api/audio/health");
 export const audioModels = () => getJSON<any>("/api/audio/models");
 
 export interface AudioGeneratePayload {
+  engine_id?: string;          // "ace_step" (vocals) | "stable_audio_3" (instrumental)
   prompt?: string;
   lyrics?: string;
   ace_model?: string | null;
   bpm?: number;
   key_scale?: string;
   duration?: number;
+  steps?: number;              // Stable Audio 3 sampling steps
   temperature?: number;
   generate_cover?: boolean;
   cover_prompt?: string | null;
@@ -113,6 +142,26 @@ export interface AudioGeneratePayload {
 
 export const audioGenerate = (payload: AudioGeneratePayload) =>
   postJSON<{ job_id: string; status: string; kind: string }>("/api/audio/generate", payload);
+
+// ---------- Audio engines (sidecar-managed, lazy-loaded) ----------
+// The sidecar owns each engine's lifecycle. `available` = files on disk (NOT
+// loaded); `running` = its process is alive. The picked engine loads on
+// Generate and the other is killed first — so only one audio model is resident.
+export type AudioEngine = {
+  id: string;
+  label: string;
+  description: string;
+  available: boolean;
+  running: boolean;
+  instrumental_only: boolean;
+  vram_hint_gb: number;
+};
+
+export const getAudioEngines = () =>
+  getJSON<{ engines: AudioEngine[]; current: string | null }>("/api/audio/engines");
+
+export const stopAudioEngines = () =>
+  postJSON<{ ok: boolean; current: string | null }>("/api/audio/engines/stop");
 
 export const getAudioJob = (jobId: string) => getJSON<any>(`/api/audio/jobs/${jobId}`);
 export const cancelAudioJob = (jobId: string) =>
@@ -263,7 +312,7 @@ export const exportedMp3DownloadUrl = (songId: string) =>
 
 // ---------- Generation ----------
 
-export type LoraEntry = { name: string; weight: number };
+export type LoraEntry = { name: string; weight?: number; model_weight?: number };
 
 export type GenerateParams = {
   arch: string;
@@ -276,12 +325,16 @@ export type GenerateParams = {
   embeddings?: string[];
   prompt: string;
   negative?: string;
+  ideogram_magic?: boolean;
+  ideogram_magic_mode?: "local" | "api" | "raw";
+  ideogram_speed_mode?: "max" | "high" | "fast";
   width: number;
   height: number;
   steps: number;
   cfg: number;
   sampler: string;
   scheduler?: string;
+  clip_skip?: number | null;
   count: number;
   seed?: number | null;
   upscale_enabled?: boolean;
@@ -305,6 +358,37 @@ export const startGenerate = (p: GenerateParams) =>
   postJSON<{ job_id: string; status: string }>("/api/generate", p);
 export const getJob = (id: string) => getJSON<JobSnapshot>(`/api/jobs/${id}`);
 export const cancelJob = (id: string) => postJSON<{ status: string }>(`/api/jobs/${id}/cancel`);
+export const ideogramMagicPrompt = (p: {
+  prompt: string;
+  negative?: string;
+  width: number;
+  height: number;
+  mode?: "local" | "api" | "raw";
+}) => postJSON<{ mode: string; prompt: string; pretty_prompt: string; aspect_ratio?: string }>("/api/ideogram4/magic-prompt", p);
+
+// ---------- Video (WAN i2v) ----------
+
+export type VideoGenerateParams = {
+  arch: string;                         // "wan"
+  diffusion_model?: string | null;      // high-noise expert
+  diffusion_model_2?: string | null;    // low-noise expert
+  vae?: string | null;
+  text_encoders?: string[];             // slot 1 = UMT5-XXL
+  loras?: LoraEntry[];
+  prompt: string;
+  negative?: string;
+  input_image?: string | null;          // data URL / raw base64 / path
+  width: number;
+  height: number;
+  num_frames: number;
+  fps: number;
+  steps: number;
+  cfg: number;
+  seed?: number | null;
+};
+
+export const startGenerateVideo = (p: VideoGenerateParams) =>
+  postJSON<{ job_id: string; status: string }>("/api/generate/video", p);
 
 // ---------- Logs ----------
 
@@ -363,14 +447,30 @@ export interface LastGenerate {
   diffusionModel?: string;
   vae?: string;
   te?: string[];
+  loras?: LoraEntry[];
+  embeddings?: string[];
   prompt?: string;
   negative?: string;
+  ideogramMagic?: boolean;
+  ideogramMagicMode?: "local" | "api" | "raw";
+  ideogramSpeedMode?: "max" | "high" | "fast";
+  preset?: string;
   w?: number;
   h?: number;
   steps?: number;
   cfg?: number;
   sampler?: string;
   scheduler?: string;
+  clipSkip?: number;
+  count?: number;
+  randomSeed?: boolean;
+  seed?: number;
+  upEnabled?: boolean;
+  upMode?: "esrgan" | "usdu" | "iterative";
+  upModel?: string;
+  upFactor?: number;
+  upDenoise?: number;
+  upTile?: number;
 }
 
 export const getSettings   = () => getJSON<Settings>("/api/settings");
@@ -403,11 +503,21 @@ export type CivitaiModel = {
   tags?: string[]; creator?: CivitaiCreator; stats?: { downloadCount?: number; rating?: number; thumbsUpCount?: number };
   modelVersions?: CivitaiVersion[];
 };
-export type CivitaiSearchResult = { items: CivitaiModel[]; metadata?: { totalItems?: number; currentPage?: number; pageSize?: number; totalPages?: number; nextPage?: string } };
+export type CivitaiSearchResult = {
+  items: CivitaiModel[];
+  metadata?: {
+    totalItems?: number;
+    currentPage?: number;
+    pageSize?: number;
+    totalPages?: number;
+    nextPage?: string;
+    nextCursor?: string;
+  };
+};
 
 export type CivitaiSearchParams = {
   query?: string; types?: string; baseModels?: string;
-  nsfw?: boolean; limit?: number; page?: number; sort?: string;
+  nsfw?: boolean; limit?: number; page?: number; sort?: string; period?: string; cursor?: string;
 };
 
 export const civitaiSearch = (p: CivitaiSearchParams) => {
@@ -419,6 +529,8 @@ export const civitaiSearch = (p: CivitaiSearchParams) => {
   if (p.limit)      q.set("limit", String(p.limit));
   if (p.page)       q.set("page", String(p.page));
   if (p.sort)       q.set("sort", p.sort);
+  if (p.period)     q.set("period", p.period);
+  if (p.cursor)     q.set("cursor", p.cursor);
   return getJSON<CivitaiSearchResult>(`/api/civitai/search?${q.toString()}`);
 };
 
@@ -430,6 +542,17 @@ export const civitaiDownload   = (modelVersionId: number, fileId?: number) =>
 // ---------- Outputs ----------
 
 export type OutputDeleteResult = { deleted: string[]; errors: { path: string; error: string }[] };
+export type LatestImageOutput = {
+  rel_path: string;
+  filename: string;
+  size_bytes: number;
+  mtime: number;
+  model_label: string;
+  arch?: string | null;
+  seed?: number | null;
+  width?: number | null;
+  height?: number | null;
+};
 
 export async function outputFileUrl(relPath: string): Promise<string> {
   return (await base()) + "/api/outputs/file/" + relPath.split("/").map(encodeURIComponent).join("/");
@@ -437,6 +560,12 @@ export async function outputFileUrl(relPath: string): Promise<string> {
 
 export const deleteOutputs = (paths: string[]) =>
   postJSON<OutputDeleteResult>("/api/outputs/delete", { paths });
+
+export const getOutputSettings = (relPath: string) =>
+  getJSON<GenerateParams>("/api/outputs/settings/" + relPath.split("/").map(encodeURIComponent).join("/"));
+
+export const getLatestImages = (limit = 9) =>
+  getJSON<{ root: string; items: LatestImageOutput[] }>(`/api/outputs/latest-images?limit=${limit}`);
 
 export async function openJobWS(jobId: string): Promise<WebSocket> {
   let wsBase: string;
