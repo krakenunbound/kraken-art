@@ -1125,20 +1125,6 @@ export default function Generate({
               </button>
             </div>
           )}
-          {archId === "ideogram4" && (
-            <div className="magic-row">
-              <label className="lbl" style={{ minWidth: 0 }}>Speed</label>
-              <select
-                value={ideogramSpeedMode}
-                onChange={(e) => setIdeogramSpeedMode(e.target.value as "max" | "high" | "fast")}
-                title="Adaptive velocity-cache. High keeps near-identical quality at ~2x speed on a 3090."
-              >
-                <option value="max">Max quality (48 steps, ~4.3 min)</option>
-                <option value="high">High — recommended (~2.0 min)</option>
-                <option value="fast">Fast draft (~1.6 min)</option>
-              </select>
-            </div>
-          )}
           {archId === "ideogram4" && (!ideogramMagic || ideogramMagicMode === "raw") && !prompt.trim().startsWith("{") && (
             <div className="model-warning">
               Raw passthrough is only used for valid Ideogram JSON. Plain text is converted to Kraken local JSON before generation.
@@ -1406,9 +1392,9 @@ export default function Generate({
               <button
                 className={steps > 12 && steps <= 20 ? "active" : ""}
                 onClick={() => setSteps(20)}
-                title="Ideogram V4_DEFAULT_20. Middle speed/quality profile."
+                title="Ideogram's V4_DEFAULT_20 preset — a balanced 20-step profile. (Named 'Default' by Ideogram; not the app's default selection.)"
               >
-                Default 20
+                Standard 20
               </button>
               <button
                 className={steps > 20 ? "active" : ""}
@@ -1417,6 +1403,20 @@ export default function Generate({
               >
                 Quality 48
               </button>
+            </div>
+            <div className="field">
+              <label title="Adaptive velocity-cache. High keeps near-identical quality at ~2x speed on a 3090.">
+                Speed (cache)
+              </label>
+              <select
+                value={ideogramSpeedMode}
+                onChange={(e) => setIdeogramSpeedMode(e.target.value as "max" | "high" | "fast")}
+                style={{ width: "100%" }}
+              >
+                <option value="max">Max — every step (~4.3 min)</option>
+                <option value="high">High — recommended (~2.0 min)</option>
+                <option value="fast">Fast — draft (~1.6 min)</option>
+              </select>
             </div>
             <div className="field-row">
               <div className="field">

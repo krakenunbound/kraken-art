@@ -55,6 +55,30 @@ def _dtype() -> torch.dtype:
     return torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
 
+# Approx VRAM the LOAD needs resident, by quant (measured 2026-06-17 on a 3090,
+# 1024px): NF4 = two DiT branches (~10 GB) + Qwen3 text encoder (~5.5 GB) + VAE
+# -> ~16-18 GB. On Windows, a CUDA allocation that can't fit doesn't raise a
+# clean OOM — bitsandbytes' Linear4bit build dies with a fatal access violation
+# (the worker crash you can hit when the card is shared with other GPU apps).
+# So we pre-check free VRAM and fail with a readable message instead.
+_LOAD_VRAM_GB = {"nf4": 16.5, "fp8": 20.0, "q4_k": 18.0, "int8_fused": 18.0}
+
+
+def _require_free_vram(quant: str) -> None:
+    if not torch.cuda.is_available():
+        return
+    need = _LOAD_VRAM_GB.get(quant, 16.5)
+    free_gb = torch.cuda.mem_get_info()[0] / (1024 ** 3)
+    if free_gb + 0.5 < need:
+        raise RuntimeError(
+            f"Not enough free VRAM to load Ideogram 4 {quant.upper()} "
+            f"(only {free_gb:.1f} GB free, needs ~{need:.0f} GB). Ideogram 4 is a "
+            f"large model and wants most of a 24 GB card to itself. Close other GPU "
+            f"apps (a browser, a game, another AI tool, a second Kraken window) or "
+            f"click Clear VRAM, then try again."
+        )
+
+
 def _ensure_ideogram_import_path() -> None:
     if not IDEOGRAM_SRC.exists():
         raise FileNotFoundError(
@@ -280,7 +304,12 @@ def _ensure_pipeline(model_name: str | None):
         return _pipeline
 
     unload()
-    log.info("loading Ideogram 4 %s from %s on %s", quant.upper(), repo, device)
+    # Fail fast with a readable message if the card is too contended to fit the
+    # model, instead of letting bitsandbytes hard-crash the worker (access
+    # violation) mid-load. Checked AFTER unload() so we count our own freed VRAM.
+    _require_free_vram(quant)
+    log.info("loading Ideogram 4 %s from %s on %s (%.1f GB free)",
+             quant.upper(), repo, device, torch.cuda.mem_get_info()[0] / (1024 ** 3) if torch.cuda.is_available() else 0.0)
     try:
         import bitsandbytes  # noqa: F401
     except Exception as e:

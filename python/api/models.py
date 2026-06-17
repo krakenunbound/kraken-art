@@ -230,13 +230,17 @@ def _virtual_ideogram_models() -> list[dict]:
             "source_type": "local_snapshot" if local_ready else "huggingface_gated",
             "detected_arch": "ideogram4",
             "warning": (
-                "Use Turbo 12 for iteration. Quality 48 is available but will take minutes per 1024px image."
+                "Quality 48 + Speed: High gives near-max quality in ~2 min on a 3090 (adaptive cache). "
+                "Drop to Turbo 12 for fast drafts."
                 if quant == "nf4"
                 else "FP8 is not the preferred RTX 3090 path; use NF4 unless you are doing a controlled comparison."
             ),
             "recommended_settings": {
                 "cfg": 7.0,
-                "steps": 12,
+                # 48 steps is the max-quality preset. With the adaptive velocity-
+                # cache (Speed: High) it lands ~2 min on a 3090, so it is now the
+                # sensible default rather than Turbo 12.
+                "steps": 48,
                 "width": 1024,
                 "height": 1024,
                 "source": f"kraken_ideogram4_{quant}",
