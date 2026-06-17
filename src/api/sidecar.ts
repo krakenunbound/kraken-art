@@ -66,6 +66,12 @@ export type GpuInfo = {
   vram_free_mb: number | null;
   gpu_utilization_percent: number | null;
   gpu_temperature_c: number | null;
+  gpu_clock_mhz: number | null;
+  gpu_clock_max_mhz: number | null;
+  power_watts: number | null;
+  power_limit_watts: number | null;
+  throttled: boolean;
+  throttle_reasons: string[];
   driver: string | null;
   cuda_runtime: string | null;
   cuda_available: boolean;

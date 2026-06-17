@@ -245,7 +245,7 @@ const ARCH_PROFILES: ArchProfile[] = [
   { id: "sdxl",         label: "SDXL (all-in-one)",        mode: "checkpoint", encoders: 0, upscaleAllowed: true,  supported: true },
   { id: "illustrious",  label: "Illustrious (SDXL variant)", mode: "checkpoint", encoders: 0, upscaleAllowed: true,  supported: true },
   { id: "flux1",        label: "FLUX1 (components)",        mode: "components", encoders: 2, upscaleAllowed: true,  supported: true },
-  { id: "ideogram4",    label: "Ideogram 4 (open weights)", mode: "components", encoders: 0, upscaleAllowed: false, supported: true },
+  { id: "ideogram4",    label: "Ideogram 4 (open weights)", mode: "components", encoders: 0, upscaleAllowed: true,  supported: true },
   { id: "flux2",        label: "FLUX2 (components) — Phase 3", mode: "components", encoders: 2, upscaleAllowed: true,  supported: false },
   { id: "z_image",      label: "Z-Image (components)",      mode: "components", encoders: 1, upscaleAllowed: true,  supported: true },
   { id: "qwen_image",   label: "Qwen-Image — Phase 3",      mode: "components", encoders: 1, upscaleAllowed: true,  supported: false },
@@ -477,11 +477,16 @@ export default function Generate({
     if (lg.checkpoint && existsIn("checkpoints", lg.checkpoint)) {
       setCheckpoint(lg.checkpoint);
       restoredPrimaryModelRef.current = lg.checkpoint;
+      // Mark recommendations as already-applied for the restored model so the
+      // "apply recommended settings" effect doesn't clobber the user's saved
+      // dimensions/steps/cfg (e.g. resetting portrait back to 1024x1024).
+      appliedRecommendationsForRef.current = lg.checkpoint;
       didRestore = true;
     }
     if (lg.diffusionModel && existsIn("diffusion_models", lg.diffusionModel)) {
       setDiffusionModel(lg.diffusionModel);
       restoredPrimaryModelRef.current = lg.diffusionModel;
+      appliedRecommendationsForRef.current = lg.diffusionModel;
       didRestore = true;
     }
     if (lg.vae && existsIn("vae", lg.vae)) {
@@ -712,6 +717,10 @@ export default function Generate({
   const [status, setStatus] = useState<string>("idle");
   const [progressMsg, setProgressMsg] = useState<string>("");
   const [step, setStep] = useState({ step: 0, total: 0 });
+  // Progress timing: genStart is set when a run begins; nowTick ticks every 1s
+  // while a job is active so "elapsed" and ETA update live.
+  const genStartRef = useRef<number | null>(null);
+  const [nowTick, setNowTick] = useState<number>(0);
   const [imgIdx, setImgIdx] = useState({ i: 0, total: 0 });
   const [previews, setPreviews] = useState<Preview[]>([]);
   const [highlightBatchKey, setHighlightBatchKey] = useState<string | null>(null);
@@ -927,10 +936,20 @@ export default function Generate({
     });
   }
 
+  // Tick once a second while a job is active so elapsed/ETA update live.
+  useEffect(() => {
+    const active = status !== "idle" && status !== "" && status !== "failed" && status !== "cancelled";
+    if (!active) return;
+    const id = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [status]);
+
   async function submit() {
     setErrorMsg(null);
     // Don't clear previews — let them accumulate across runs so the user can
     // compare. Use "Clear gallery" to wipe.
+    genStartRef.current = Date.now();
+    setNowTick(Date.now());
     setStep({ step: 0, total: steps });
     setImgIdx({ i: 0, total: count });
     setStatus("submitting");
@@ -1028,10 +1047,21 @@ export default function Generate({
   }
 
   const busy = status === "queued" || status === "running" || status === "submitting";
-  const overallPct =
-    imgIdx.total > 0
-      ? Math.floor(((imgIdx.i * step.total + step.step) / (imgIdx.total * Math.max(step.total, 1))) * 100)
-      : 0;
+  const doneSteps = imgIdx.i * step.total + step.step;
+  const totalSteps = imgIdx.total * Math.max(step.total, 1);
+  const overallPct = imgIdx.total > 0 ? Math.floor((doneSteps / totalSteps) * 100) : 0;
+
+  // Live timing for the progress bar. Rate = completed steps / elapsed; ETA =
+  // remaining steps / rate. Only meaningful once at least one step has landed.
+  const elapsedSec = genStartRef.current ? Math.max(0, ((nowTick || Date.now()) - genStartRef.current) / 1000) : 0;
+  const stepRate = doneSteps > 0 && elapsedSec > 0 ? doneSteps / elapsedSec : 0; // steps/sec
+  const etaSec = stepRate > 0 ? Math.max(0, (totalSteps - doneSteps) / stepRate) : 0;
+  const fmtDur = (s: number) => {
+    s = Math.round(s);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  };
 
   const primaryModelMissing =
     (profile.mode === "checkpoint" && !checkpoint) ||
@@ -1144,6 +1174,13 @@ export default function Generate({
               {status !== "idle" && (
             <span className="muted small">
               {progressMsg || status} · {imgIdx.i + 1}/{Math.max(imgIdx.total, 1)} · step {step.step}/{step.total || "?"}
+              {busy && elapsedSec > 0 && (
+                <>
+                  {" · "}{fmtDur(elapsedSec)} elapsed
+                  {etaSec > 0 && <> · ~{fmtDur(etaSec)} left</>}
+                  {stepRate > 0 && <> · {stepRate >= 1 ? `${stepRate.toFixed(1)} it/s` : `${(1 / stepRate).toFixed(1)} s/it`}</>}
+                </>
+              )}
             </span>
           )}
         </div>

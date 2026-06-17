@@ -763,6 +763,25 @@ def _run_inprocess(job) -> dict:
             "height": height,
             "rel_path": rel_path,
         }
+
+        # Optional upscale — runs on the finished image, so it's arch-agnostic.
+        # This is the recommended path for big Ideogram output: render native
+        # ~1 MP (fast, fits 24 GB), then upscale 2x/4x instead of native-2K
+        # (which spills VRAM and crawls).
+        if p.get("upscale_enabled") and p.get("upscale_model"):
+            try:
+                from pipelines import upscale_esrgan
+                job.progress.message = "Upscaling Ideogram 4 image"
+                job.emit({"type": "progress", "step": preset.num_steps, "total_steps": preset.num_steps,
+                          "image_index": i, "total_images": count, "message": "Upscaling..."})
+                up = upscale_esrgan.upscale(img, p["upscale_model"], float(p.get("upscale_factor", 2.0)))
+                up_path = out_dir / f"{base_stem}-{i:02d}-up.png"
+                save_png_with_metadata(up, up_path, p, int(per_seed))
+                entry["upscaled_path"] = str(up_path)
+                img = up  # preview the upscaled version
+            except Exception as e:
+                log.warning("Ideogram upscale failed: %s", e)
+
         saved.append(entry)
         job.progress.step = preset.num_steps
         job.progress.message = "Saving Ideogram 4 image"
