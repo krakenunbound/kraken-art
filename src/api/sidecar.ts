@@ -366,6 +366,18 @@ export const ideogramMagicPrompt = (p: {
   mode?: "local" | "api" | "raw";
 }) => postJSON<{ mode: string; prompt: string; pretty_prompt: string; aspect_ratio?: string }>("/api/ideogram4/magic-prompt", p);
 
+// ---------- Prompt Builder (deterministic, shared across image archs) ----------
+export type PromptBuilderOption = { value: string; label: string };
+export type PromptBuilderOptions = Record<"style" | "lighting" | "camera" | "mood", PromptBuilderOption[]>;
+export type PromptBuildResult = { arch: string; format: string; prompt: string; pretty: string; aspect_ratio: string };
+
+export const promptBuilderOptions = () => getJSON<PromptBuilderOptions>("/api/prompt-builder/options");
+export const promptBuilderBuild = (p: {
+  arch: string; subject: string; texts?: string[];
+  style?: string; lighting?: string; camera?: string; mood?: string;
+  negative?: string; width?: number; height?: number;
+}) => postJSON<PromptBuildResult>("/api/prompt-builder/build", p);
+
 // ---------- Video (WAN i2v) ----------
 
 export type VideoGenerateParams = {

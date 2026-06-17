@@ -190,6 +190,40 @@ def ideogram_magic_prompt(req: IdeogramMagicPromptRequest) -> dict:
         raise HTTPException(500, f"{type(e).__name__}: {e}") from e
 
 
+# ---- Deterministic prompt builder (shared across image archs) --------------
+# One "scene" (subject + style/lighting/camera/mood picks + in-image text)
+# renders into each model's native dialect: Ideogram -> structured JSON,
+# FLUX/Z-Image -> natural-language paragraph, SDXL -> concise tags. No LLM.
+
+class PromptBuilderRequest(BaseModel):
+    arch: str = "ideogram4"
+    subject: str = ""
+    texts: list[str] = Field(default_factory=list)
+    style: str = "auto"
+    lighting: str = "auto"
+    camera: str = "auto"
+    mood: str = "auto"
+    negative: str = ""
+    width: int = 1024
+    height: int = 1024
+
+
+@router.get("/prompt-builder/options")
+def prompt_builder_options() -> dict:
+    from pipelines import prompt_builder
+    return prompt_builder.options()
+
+
+@router.post("/prompt-builder/build")
+def prompt_builder_build(req: PromptBuilderRequest) -> dict:
+    from pipelines import prompt_builder
+    try:
+        spec = prompt_builder.spec_from_payload(req.model_dump())
+        return prompt_builder.build(spec, req.arch)
+    except Exception as e:
+        raise HTTPException(500, f"{type(e).__name__}: {e}") from e
+
+
 @router.get("/jobs/{job_id}")
 def get_job(job_id: str) -> dict:
     job = manager.get(job_id)

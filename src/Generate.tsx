@@ -6,6 +6,9 @@ import {
   getOutputSettings,
   getLatestImages,
   ideogramMagicPrompt,
+  promptBuilderOptions,
+  promptBuilderBuild,
+  type PromptBuilderOptions,
   openJobWS,
   outputFileUrl,
   saveLastGenerate,
@@ -340,6 +343,37 @@ export default function Generate({
   // Adaptive velocity-cache speed/quality knob (Ideogram only). high = ~2x faster
   // at near-identical quality on a 3090; measured 2026-06-17.
   const [ideogramSpeedMode, setIdeogramSpeedMode] = useState<"max" | "high" | "fast">("high");
+
+  // ---- Prompt Builder (deterministic, renders to the current arch's dialect) ----
+  const [pbOpen, setPbOpen] = useState(false);
+  const [pbOptions, setPbOptions] = useState<PromptBuilderOptions | null>(null);
+  const [pbStyle, setPbStyle] = useState("auto");
+  const [pbLighting, setPbLighting] = useState("auto");
+  const [pbCamera, setPbCamera] = useState("auto");
+  const [pbMood, setPbMood] = useState("auto");
+  const [pbBusy, setPbBusy] = useState(false);
+
+  useEffect(() => {
+    promptBuilderOptions().then(setPbOptions).catch(() => setPbOptions(null));
+  }, []);
+
+  async function buildPrompt() {
+    setPbBusy(true);
+    try {
+      const r = await promptBuilderBuild({
+        arch: archId,
+        subject: prompt.trim() || DEFAULT_PROMPT,
+        negative,
+        style: pbStyle, lighting: pbLighting, camera: pbCamera, mood: pbMood,
+        width: w, height: h,
+      });
+      setPrompt(r.prompt);
+    } catch (e: any) {
+      window.alert(`Prompt builder failed: ${e?.message ?? e}`);
+    } finally {
+      setPbBusy(false);
+    }
+  }
   const [magicBusy, setMagicBusy] = useState(false);
   const [preset, setPreset] = useState("1024 × 1024");
   const [w, setW] = useState(1024);
@@ -1026,6 +1060,47 @@ export default function Generate({
           </div>
           <textarea className="prompt-main" rows={12} value={prompt} onChange={(e) => setPrompt(e.target.value)}
             placeholder={DEFAULT_PROMPT} />
+
+          {/* Deterministic prompt builder — one scene, rendered into the
+              current model's native dialect (Ideogram JSON / FLUX prose / SDXL tags). */}
+          <div className="prompt-builder">
+            <button className="mini pb-toggle" onClick={() => setPbOpen((o) => !o)}>
+              {pbOpen ? "▾" : "▸"} Prompt Builder
+              <span className="muted small" style={{ marginLeft: 8 }}>
+                {archId === "ideogram4" ? "→ Ideogram JSON"
+                  : archId === "sdxl" || archId === "illustrious" ? "→ SDXL tags"
+                  : "→ natural-language prose"}
+              </span>
+            </button>
+            {pbOpen && pbOptions && (
+              <div className="pb-body">
+                <div className="pb-grid">
+                  {([["Style", pbStyle, setPbStyle, pbOptions.style],
+                     ["Lighting", pbLighting, setPbLighting, pbOptions.lighting],
+                     ["Camera", pbCamera, setPbCamera, pbOptions.camera],
+                     ["Mood", pbMood, setPbMood, pbOptions.mood]] as const).map(
+                    ([label, val, set, opts]) => (
+                      <label key={label} className="pb-field">
+                        <span>{label}</span>
+                        <select value={val} onChange={(e) => (set as (v: string) => void)(e.target.value)}>
+                          {opts.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                        </select>
+                      </label>
+                    ))}
+                </div>
+                <div className="pb-actions">
+                  <span className="muted small">
+                    Type your subject in the prompt box above, pick options, then build.
+                    Quote any in-image text, e.g. &quot;OPEN&quot;.
+                  </span>
+                  <button className="primary" onClick={buildPrompt} disabled={pbBusy}>
+                    {pbBusy ? "Building…" : "Build prompt"}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
           {archId === "ideogram4" && (
             <div className="magic-row">
               <label className="checkline">
