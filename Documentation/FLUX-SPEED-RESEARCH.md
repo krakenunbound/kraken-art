@@ -4,34 +4,195 @@ What other people have actually tried (with URLs), so future sessions don't
 re-research these. Companion to `FLUX-SPEED-WIP.md` (which tracks our
 in-tree experiments and results).
 
-**Last updated:** 2026-05-22 midday.
+**Last updated:** 2026-05-22 afternoon, after running an A/B against the
+user's ComfyUI install.
 
 ---
 
-## Cross-check: are we at floor or behind?
+## comfy-kitchen apply_rope patch — in-context regression (2026-05-22)
 
-| Reporter | Hardware | Config | Step time |
-|---|---|---|---|
-| FurkanGozukara wiki | 3090 Ti | ComfyUI, FLUX-dev **FP8**, 1024² | 1.27 s/it |
-| Comfy-Org #9002 | 3090 | ComfyUI, FLUX-dev **FP8**, 20-step preset | ~1.3 s/it |
-| (us, last night) | 3090 | ComfyUI on this same box, bf16 | 1.71 s/it |
-| **(us, today)** | **3090** | **diffusers 0.38, bf16, streaming** | **2.06 s/it** |
+Standalone bench (CUDA backend on this 3090 with FLUX-shaped tensors `[1, 4608, 24, 128]`):
+- diffusers' `apply_rotary_emb` (original): **2.84 ms/call**
+- our `_ck_apply_rotary_emb` (with freqs_cis build + cache hit): **1.49 ms/call**
+- raw `ck.apply_rope1` (pre-built freqs): 6.22 ms/call
 
-Two facts to internalize:
-1. **ComfyUI's published-fast numbers are FP8, not bf16.** ComfyUI auto-casts to
-   `fp8_e4m3fn` on Ampere for matmul throughput. Their bf16 number on our box is
-   1.71 s/it (matches research).
-2. **No public diffusers-FLUX recipe sub-2 s/step on a vanilla 3090 in bf16
-   has been posted.** All the sayakpaul/torchao recipes are A100/H100 only.
+The patched path IS faster in isolation. **But wired into `FluxAttnProcessor` running inside our streaming-partition pipeline, per-step time exploded from 2 s to ~24 s.** Patch disabled in `flux.py` (`# install_ck_rope_patch()` line), code preserved in `pipelines/kraken_rope.py`.
 
-So our 2.06 s baseline is **~20 % behind a tuned-comfy bf16** and ~60 %
-behind FP8. The 20 % is reachable with torch.compile. The full 60 % requires
-quantization (NF4 or FP8) — Ampere can't do native FP8 but **NF4 via
-bitsandbytes is on the table**.
+**Theories not yet validated:**
+1. Sync between our mover CUDA stream (streaming offload) and the comfy-kitchen kernel call. The streamed-block prefetch and the apply_rope kernel may be serializing in a way diffusers' tensor-op-only original doesn't.
+2. Output tensor stride differs from diffusers' original; downstream `dispatch_attention_fn` then materializes a copy each call.
+3. VRAM pressure — we saw 213 MB / 486 MB free during these gens. Each new kernel invocation could be triggering allocator thrash.
 
-Sources:
-- [FurkanGozukara wiki — RTX 3090 Ti FLUX-dev benchmark](https://github.com/FurkanGozukara/Stable-Diffusion/wiki/RTX-5090-Tested-Against-FLUX-DEV-SD-35-Large-SD-35-Medium-SDXL-SD-15-AMD-9950X-RTX-3090-TI)
-- [Comfy-Org #9002 — FLUX DEV fp8 3090 benchmark](https://github.com/Comfy-Org/ComfyUI/discussions/9002)
+**To validate**: run the patch on a model that fits the FAST path (no streaming) — fluxmania FP8 at default settings. If it's fast there, the regression is streaming-stream interaction. If it's still slow, the regression is dispatch/allocator. Logged as a follow-up; deferred for now in favor of higher-impact research.
+
+## Grok independent analysis (2026-05-22)
+
+The user ran an independent analysis via Grok ([grok_findings.md](grok_findings.md)). Grok arrived at the same per-step measurements and conclusions, AND flagged one major lever I'd missed:
+
+**First Block Cache via `para-attn`** — Grok calls this *"the single biggest reason ComfyUI feels dramatically faster"* and recommends:
+
+```python
+from para_attn.first_block_cache.diffusers_adapters import apply_cache_on_pipe
+apply_cache_on_pipe(pipe, residual_diff_threshold=0.08)  # tune 0.06–0.12
+```
+
+Claimed: **1.5–2× effective speedup on FLUX with minimal quality impact.** This is a residual-diff-based step-skipping technique (TeaCache / FBCache family). For a 28-step gen, if the FBC kicks in 14 times, that's effectively 14 steps of compute — huge.
+
+**Tried 2026-05-22, NET NEGATIVE in our pipeline (10-50 s/step vs 2 s/step baseline).** Reasons:
+
+1. **API mismatch:** para-attn 0.3.38's `call_remaining_transformer_blocks` was written against an older diffusers where `FluxSingleTransformerBlock.forward` took a single pre-concatenated `hidden_states`. Diffusers 0.38 refactored these blocks to take `(hidden_states, encoder_hidden_states, ...)` separately and return a tuple. We patched para-attn (`pipelines/kraken_fbcache.py`) to use the new signature, which fixes the TypeError but didn't make it fast.
+
+2. **Streaming-offload contention:** FBCache stores `first_hidden_states_residual`, `hidden_states_residual`, and `encoder_hidden_states_residual` as cache buffers. With our streaming partition already using the activation budget for streamed weights (1.85 GB streamed + 2 GB activations on a 24 GB card), the additional ~1-2 GB of FBCache buffers pushes us into allocator thrash. ComfyUI ships with FBCache WITHOUT streaming — their FLUX-dev auto-FP8 fits fully resident, so no contention.
+
+**Where this could still help in our code:** if we have a model that fits the fast path (no streaming), FBCache should be a real win there. e.g. fluxmania FP8 (~11 GB) on a 24 GB card. Settings knob preserved: `performance.flux_fbcache=on` opt-in (default off). Threshold 0.06-0.12 configurable. Tracked as task #50 → revisit after fast-mode-only models are in scope.
+
+---
+
+## Direct A/B vs ComfyUI on the same hardware (2026-05-22)
+
+Used `python/bench_comfyui.py` to queue the user's "Flux Basic Workflow" through
+ComfyUI's `/prompt` API and capture per-step times from their `/ws` progress
+stream. SAME model, SAME text encoders, SAME resolution, SAME sampler — the
+ONLY difference is the inference stack.
+
+| | ComfyUI 0.19.4 + torch 2.11 + comfy_kitchen | Kraken Art 0.1 + torch 2.6 + diffusers |
+|---|---|---|
+| Median step | **1731 ms** | 2061 ms |
+| Min step | **1286 ms** | 2012 ms |
+| Mean step | **1751 ms** | 2135 ms |
+| Total cold | 79 s | ~75 s warm (we have T5 disk cache they don't) |
+| Workflow | FP32 flux_dev + t5xxl_fp16 + CLIP-L + fluxVae | identical |
+| Steps × CFG | 28 × 1.0 | 28 × 1.0 |
+| Resolution | 1024² | 1024² |
+
+ComfyUI's **min** step is 36 % faster than ours. **Median** is 16 % faster.
+The gap is real and reproducible.
+
+## What ComfyUI is doing that we aren't (read from their source)
+
+ComfyUI's startup log on this box shows:
+
+```
+Found comfy_kitchen backend cuda: {capabilities: [apply_rope, apply_rope1,
+  dequantize_per_tensor_fp8, quantize_mxfp8, quantize_nvfp4,
+  quantize_per_tensor_fp8, scaled_mm_nvfp4]}
+Using async weight offloading with 2 streams
+Using pytorch attention
+```
+
+Three distinct mechanisms, in order of likely impact:
+
+### 1. `comfy-kitchen` is a public pip package with fused C++ kernels
+
+**This is the smoking gun.** `comfy-kitchen` 0.2.8 is an open-source
+(Apache-2.0) library from Comfy-Org. Provides CUDA + Triton backends for:
+- `apply_rope` / `apply_rope1` — fused rotary embedding (no fp32 round-trip)
+- `quantize_per_tensor_fp8`, `dequantize_per_tensor_fp8`
+- `quantize_mxfp8`, `quantize_nvfp4`, matching `dequantize_*`
+- `scaled_mm_mxfp8`, `scaled_mm_nvfp4` — low-precision matmul
+
+How ComfyUI uses it (from `comfy/ldm/flux/math.py:42-63`):
+
+```python
+def _apply_rope(xq, xk, freqs_cis):
+    # pure-Python implementation — equivalent to diffusers' apply_rotary_emb
+    ...
+
+try:
+    q_apply_rope = comfy.quant_ops.ck.apply_rope
+    def apply_rope(xq, xk, freqs_cis):
+        if pe.shape[3] == 1:
+            return _apply_rope(xq, xk, freqs_cis)
+        return comfy.quant_ops.ck.apply_rope(xq, xk, freqs_cis)
+except ImportError:
+    logging.warning("No comfy kitchen, using old apply_rope functions.")
+    apply_rope = _apply_rope
+```
+
+The fact that they EXPLICITLY check for it and warn if absent tells us they
+measured the kernel is meaningfully faster than the pure-Python path.
+
+**Pip-installable** — `pip install comfy-kitchen`. Source:
+[github.com/Comfy-Org/comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen).
+Tracked as task #49.
+
+### 2. Async weight offload with TWO CUDA streams — THIS IS THE MAIN GAP
+
+After actually reading `comfy/model_management.py:1155-1261` + `comfy/ops.py:210-258` (2026-05-22):
+
+**ComfyUI's mechanism:**
+
+```python
+# 1. Default 2 streams on NVIDIA/AMD (CLI: --async-offload to tune)
+NUM_STREAMS = 2
+
+# 2. Pre-create both as torch.cuda.Stream with priority=0
+ss = [torch.cuda.Stream(device, priority=0) for _ in range(2)]
+
+# 3. Round-robin selection — get_offload_stream() returns ss[counter],
+#    increments counter, and (critically) has the chosen stream WAIT for
+#    the compute stream before it does anything:
+def get_offload_stream(device):
+    ss[counter].wait_stream(current_stream(device))      # offload waits for compute
+    counter = (counter + 1) % 2
+    return ss[counter]
+
+# 4. Preallocated cast buffer per stream — int8 of size=largest_weight.
+#    Reused across all Linear forwards. NO per-call allocation.
+def get_cast_buffer(stream, device, size, ref):
+    buf = STREAM_CAST_BUFFERS.get(stream)
+    if buf is None or buf.numel() < size:
+        buf = torch.empty(size, dtype=torch.int8, device=device)
+        STREAM_CAST_BUFFERS[stream] = buf
+    return buf
+
+# 5. Per-Linear forward (comfy/ops.py:230-258):
+offload_stream = get_offload_stream(device)
+cast_buffer = get_cast_buffer(offload_stream, device, weight.nbytes + bias.nbytes, layer)
+[weight_view, bias_view] = interpret_gathered_like([s.weight, s.bias], cast_buffer)
+weight = cast_to(s.weight, dtype, device, non_blocking=True, stream=offload_stream, r=weight_view)
+bias   = cast_to(s.bias,   dtype, device, non_blocking=True, stream=offload_stream, r=bias_view)
+sync_stream(device, offload_stream)   # compute waits for this stream
+```
+
+**Our mechanism (current `pipelines/streaming_linear.py`):**
+
+```python
+# 1 stream, 1 buffer-allocation per call, no round-robin:
+weight = self.weight.to(device, non_blocking=True)   # allocates new GPU tensor each call
+torch.cuda.current_stream(device).wait_event(self._kraken_pending_event)
+```
+
+**Why ComfyUI wins ~330 ms/step:**
+- Their pipeline depth is **2** (one stream copies layer N's weight while the other can already be queuing layer N+1's).
+- Their copies write into a **preallocated reusable buffer** — no allocator pressure, no GPU memory churn.
+- Each `get_offload_stream` rotates AND inserts a wait — so the compute stream and offload streams form a producer/consumer pipeline.
+
+**Port plan (task #51):**
+1. Module-level `STREAMS = []` of 2 CUDA streams + `STREAM_BUFFERS = {}` of preallocated buffers.
+2. Replace `_get_mover_stream` (current single-stream singleton) with `get_offload_stream` that round-robins.
+3. Replace `_kraken_pending_w` per-call allocation with a `copy_` into the preallocated buffer.
+4. Compute stream waits for the picked offload_stream after each copy — same `sync_stream` pattern.
+5. KEEP our per-block prefetch hook on top — it's complementary (queues N+1 while N is still computing).
+
+Source: `D:\AI_Art\ComfyUI\comfy\model_management.py:1155-1318`, `comfy/ops.py:210-280`.
+
+### 3. PyTorch 2.11 vs our 2.6
+
+Five major versions difference. Improvements between 2.6 and 2.11:
+- SDPA backend rewrite (PyTorch 2.7)
+- New `flash_attention` integrated path (PyTorch 2.8)
+- Compile fixes for fp16/bf16 inductor codegen (PyTorch 2.9)
+- Better memory_format handling (PyTorch 2.10)
+
+Hard to quantify the gain from torch upgrade alone vs comfy_kitchen, but
+ComfyUI bundles 2.11 and that's part of why their stock SDPA path is faster.
+Upgrading our venv to torch 2.7 (matches CUDA 12.4 binary wheels) would let
+us A/B without major surgery.
+
+## Things to skip / already-tried dead ends
+
+(see following sections — these still apply)
 
 ---
 

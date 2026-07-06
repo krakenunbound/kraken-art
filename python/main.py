@@ -24,6 +24,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 # Ensure local imports work no matter how python is invoked.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import asyncio
 import logging
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -46,6 +47,10 @@ from api.system import router as system_router
 from api.settings import router as settings_router
 from api.civitai import router as civitai_router
 from api.outputs import router as outputs_router
+from api.audio import router as audio_router
+from api.cover_art import router as cover_art_router
+from api.upscale import router as upscale_router
+from api.video_upscale import router as video_upscale_router
 
 app = FastAPI(title="Kraken Art Sidecar", version="0.1.0")
 
@@ -109,10 +114,64 @@ app.include_router(system_router,   prefix="/api")
 app.include_router(settings_router, prefix="/api")
 app.include_router(civitai_router,  prefix="/api")
 app.include_router(outputs_router,  prefix="/api")
+app.include_router(audio_router,    prefix="/api")   # Music / ACE-Step bridge
+app.include_router(cover_art_router, prefix="/api")  # Phase C: cover-art for Music tab + Song Studio
+app.include_router(upscale_router,  prefix="/api")   # Image Upscale tab (USDU + ESRGAN)
+app.include_router(video_upscale_router, prefix="/api")  # SeedVR2 video upscale + fps conversion
 app.include_router(progress_router)  # WebSocket path uses /ws/...
+
+
+@app.on_event("startup")
+async def _quiet_windows_connection_reset_noise() -> None:
+    """Hide noisy WinError 10054 cleanup callbacks from closed HTTP clients.
+
+    On Windows, asyncio's Proactor transport can log a remote close during
+    socket shutdown as an ERROR even after the request itself completed. Keep
+    the filter tight so actual application exceptions still go to the log.
+    """
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+
+    def handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+        exc = context.get("exception")
+        handle = str(context.get("handle") or "")
+        is_proactor_reset = (
+            isinstance(exc, ConnectionResetError)
+            and getattr(exc, "winerror", None) == 10054
+            and "_ProactorBasePipeTransport._call_connection_lost" in handle
+        )
+        if is_proactor_reset:
+            logging.getLogger("asyncio").debug("suppressed Windows proactor connection reset during socket cleanup")
+            return
+        if previous:
+            previous(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
+
+
+@app.on_event("shutdown")
+def _stop_audio_engines_on_shutdown() -> None:
+    """Kill any audio engine subprocess the sidecar spawned so they don't orphan
+    when the app exits (the sidecar owns their lifecycle)."""
+    try:
+        from pipelines.audio.engine_manager import manager as audio_engines
+        audio_engines.stop_all()
+    except Exception:
+        pass
+    try:
+        from pipelines.audio import song_studio_service
+        song_studio_service.stop()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
     import uvicorn
     OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
-    uvicorn.run("main:app", host=SIDECAR_HOST, port=SIDECAR_PORT, log_level="info")
+    # Pass the app OBJECT, not the "main:app" import string. The string form makes
+    # uvicorn re-import this module (it's already running as __main__), which
+    # re-runs startup and logs "sidecar starting" a second time — the confusing
+    # double line in the logs. No reload/workers here, so the object is correct.
+    uvicorn.run(app, host=SIDECAR_HOST, port=SIDECAR_PORT, log_level="info")

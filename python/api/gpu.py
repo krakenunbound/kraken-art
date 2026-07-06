@@ -13,6 +13,14 @@ def gpu_info() -> dict:
         "name": None,
         "vram_total_mb": None,
         "vram_free_mb": None,
+        "gpu_utilization_percent": None,
+        "gpu_temperature_c": None,
+        "gpu_clock_mhz": None,
+        "gpu_clock_max_mhz": None,
+        "power_watts": None,
+        "power_limit_watts": None,
+        "throttled": False,
+        "throttle_reasons": [],
         "driver": None,
         "cuda_runtime": None,
         "cuda_available": False,
@@ -41,6 +49,50 @@ def gpu_info() -> dict:
         mem = pynvml.nvmlDeviceGetMemoryInfo(h)
         info["vram_total_mb"] = mem.total // (1024 * 1024)
         info["vram_free_mb"] = mem.free // (1024 * 1024)
+        try:
+            util = pynvml.nvmlDeviceGetUtilizationRates(h)
+            info["gpu_utilization_percent"] = int(util.gpu)
+        except Exception as e:
+            info["errors"].append(f"pynvml utilization: {e}")
+        try:
+            info["gpu_temperature_c"] = int(
+                pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
+            )
+        except Exception as e:
+            info["errors"].append(f"pynvml temperature: {e}")
+        # Current vs max core clock — a big gap during a 100%-util job means the
+        # card is being held back (almost always heat on a 3090).
+        try:
+            info["gpu_clock_mhz"] = int(pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS))
+            info["gpu_clock_max_mhz"] = int(pynvml.nvmlDeviceGetMaxClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS))
+        except Exception as e:
+            info["errors"].append(f"pynvml clocks: {e}")
+        try:
+            info["power_watts"] = round(pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0, 1)
+            info["power_limit_watts"] = round(pynvml.nvmlDeviceGetEnforcedPowerLimit(h) / 1000.0, 1)
+        except Exception as e:
+            info["errors"].append(f"pynvml power: {e}")
+        # Throttle reasons (bitmask). Thermal/power slowdown = the card is
+        # capping its own clocks. Names vary across pynvml versions, so look
+        # each up defensively.
+        try:
+            reasons = pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(h)
+            reason_map = [
+                ("nvmlClocksThrottleReasonSwThermalSlowdown", "thermal (soft)"),
+                ("nvmlClocksThrottleReasonHwThermalSlowdown", "thermal (hard)"),
+                ("nvmlClocksThrottleReasonHwSlowdown", "hardware slowdown"),
+                ("nvmlClocksThrottleReasonSwPowerCap", "power limit"),
+                ("nvmlClocksThrottleReasonHwPowerBrakeSlowdown", "power brake"),
+            ]
+            active = []
+            for attr, label in reason_map:
+                bit = getattr(pynvml, attr, 0)
+                if bit and (reasons & bit):
+                    active.append(label)
+            info["throttle_reasons"] = active
+            info["throttled"] = bool(active)
+        except Exception as e:
+            info["errors"].append(f"pynvml throttle: {e}")
         info["driver"] = pynvml.nvmlSystemGetDriverVersion()
         if not info["name"]:
             info["name"] = pynvml.nvmlDeviceGetName(h)

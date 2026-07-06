@@ -64,6 +64,14 @@ export type GpuInfo = {
   name: string | null;
   vram_total_mb: number | null;
   vram_free_mb: number | null;
+  gpu_utilization_percent: number | null;
+  gpu_temperature_c: number | null;
+  gpu_clock_mhz: number | null;
+  gpu_clock_max_mhz: number | null;
+  power_watts: number | null;
+  power_limit_watts: number | null;
+  throttled: boolean;
+  throttle_reasons: string[];
   driver: string | null;
   cuda_runtime: string | null;
   cuda_available: boolean;
@@ -74,10 +82,37 @@ export type GpuInfo = {
 export type DepPackage = { name: string; required: string; installed: string | null; ok: boolean; remedy: string | null };
 export type DepsStatus = { all_ok: boolean; missing: number; packages: DepPackage[] };
 
-export type ModelEntry = { name: string; filename: string; subdir: string; abs_path: string; size_bytes: number; ext: string };
+export type ModelEntry = {
+  name: string;
+  filename: string;
+  subdir: string;
+  abs_path: string;
+  size_bytes: number;
+  ext: string;
+  base_model?: string | null;
+  source_type?: string | null;
+  detected_arch?: string | null;
+  experimental?: boolean | null;
+  disabled_by_default?: boolean | null;
+  warning?: string | null;
+  recommended_settings?: {
+    cfg?: number;
+    cfg_range?: [number, number];
+    steps?: number;
+    steps_range?: [number, number];
+    width?: number;
+    height?: number;
+    resolutions?: [number, number][];
+    sampler?: string;
+    scheduler?: string;
+    source?: string;
+  } | null;
+};
 export type ModelListing = {
   root: string;
   exists: boolean;
+  audio_ace_root?: string;
+  audio_ace_exists?: boolean;
   categories: Record<string, ModelEntry[]>;
   counts: Record<string, number>;
 };
@@ -90,9 +125,270 @@ export const getDeps        = () => getJSON<DepsStatus>("/api/deps");
 export const getModels      = () => getJSON<ModelListing>("/api/models");
 export const refreshModels  = () => postJSON<{ refreshed: boolean; counts: Record<string, number> }>("/api/models/refresh");
 
+// ---------- Audio (ACE-Step bridge) ----------
+export type AudioHealth = { ok: boolean; detail: any };
+export const audioHealth = () => getJSON<AudioHealth>("/api/audio/health");
+export const audioModels = () => getJSON<any>("/api/audio/models");
+
+export interface AudioGeneratePayload {
+  engine_id?: string;          // "ace_step" (vocals) | "stable_audio_3" (instrumental)
+  prompt?: string;
+  lyrics?: string;
+  ace_model?: string | null;
+  bpm?: number;
+  key_scale?: string;
+  duration?: number;
+  steps?: number;              // Stable Audio 3 sampling steps
+  temperature?: number;
+  generate_cover?: boolean;
+  cover_prompt?: string | null;
+  thinking?: boolean;
+  sample_mode?: boolean;
+}
+
+export const audioGenerate = (payload: AudioGeneratePayload) =>
+  postJSON<{ job_id: string; status: string; kind: string }>("/api/audio/generate", payload);
+
+// ---------- Audio engines (sidecar-managed, lazy-loaded) ----------
+// The sidecar owns each engine's lifecycle. `available` = files on disk (NOT
+// loaded); `running` = its process is alive. The picked engine loads on
+// Generate and the other is killed first — so only one audio model is resident.
+export type AudioEngine = {
+  id: string;
+  label: string;
+  description: string;
+  available: boolean;
+  running: boolean;
+  instrumental_only: boolean;
+  vram_hint_gb: number;
+  capability?: string;
+  direct_runner?: boolean;
+};
+
+export const getAudioEngines = () =>
+  getJSON<{ engines: AudioEngine[]; current: string | null }>("/api/audio/engines");
+
+export type AudioProvider = {
+  id: string;
+  capability: string;
+  label: string;
+  available: boolean;
+  installed: boolean;
+  recommended: boolean;
+  notes: string;
+  install_hint?: string | null;
+};
+
+export const getAudioProviders = () =>
+  getJSON<{ providers: AudioProvider[] }>("/api/audio/providers");
+
+export const stopAudioEngines = () =>
+  postJSON<{ ok: boolean; current: string | null }>("/api/audio/engines/stop");
+
+export const getAudioJob = (jobId: string) => getJSON<any>(`/api/audio/jobs/${jobId}`);
+export const cancelAudioJob = (jobId: string) =>
+  postJSON<any>(`/api/audio/jobs/${jobId}/cancel`, {});
+
+export const audioFileUrl = (absPath: string) =>
+  `/api/audio/file?path=${encodeURIComponent(absPath)}`;  // relative to the sidecar — works in Tauri webview
+
+export const localAudioFileUrl = (absPath: string) =>
+  `/api/audio/local-file?path=${encodeURIComponent(absPath)}`;
+
+// ---------- Speech / dialogue ----------
+
+export type TtsVoice = {
+  id: string;
+  name: string;
+  file?: string;
+  ref_text?: string;
+  created?: string;
+};
+
+export const getTtsVoices = () =>
+  getJSON<{ preset: TtsVoice[]; custom: TtsVoice[] }>("/api/audio/tts/voices");
+
+export async function uploadTtsVoice(file: File, name: string, refText = ""): Promise<TtsVoice> {
+  const body = new FormData();
+  body.set("name", name);
+  body.set("ref_text", refText);
+  body.set("audio", file);
+  const path = "/api/audio/tts/voices";
+  const r = await fetch((await base()) + path, { method: "POST", body });
+  if (!r.ok) throw await readError(r, path);
+  return r.json() as Promise<TtsVoice>;
+}
+
+export type SpeechGeneratePayload = {
+  text: string;
+  voice_id: string;
+  provider?: string;
+  speed?: number;
+  num_steps?: number;
+  t_shift?: number;
+  ref_duration?: number;
+};
+
+export const generateSpeech = (payload: SpeechGeneratePayload) =>
+  postJSON<any>("/api/audio/speech/generate", payload);
+
+export type DialogueGeneratePayload = {
+  script: string;
+  speakers: Record<string, string>;
+  provider?: string;
+  speed?: number;
+  num_steps?: number;
+  t_shift?: number;
+  ref_duration?: number;
+  gap_seconds?: number;
+};
+
+export const generateDialogue = (payload: DialogueGeneratePayload) =>
+  postJSON<any>("/api/audio/dialogue/generate", payload);
+
+// ---------- Song Studio (port 8010 — workstation: library, playlists, etc.) ----------
+//
+// All these go through our /api/audio/* proxy. The webview never talks to
+// 8010 directly. See python/api/audio.py for the proxy implementations.
+
+export type SongStudioModel = {
+  id: string;
+  label: string;
+  provider: string;
+  params?: string;
+  local?: boolean;
+  recommended?: boolean;
+  status?: string;
+  notes?: string;
+};
+
+export type SongStudioHealth = {
+  ok: boolean;
+  base_url: string;
+  config?: {
+    assistantReady?: boolean;
+    assistantProvider?: string;
+    assistantStatus?: string;
+    voiceCloneReady?: boolean;
+    voiceCloneStatus?: string;
+    coverArtReady?: boolean;
+    coverArtStatus?: string;
+    generationModels?: SongStudioModel[];
+    defaultGenerationModel?: string;
+    defaultWorkspace?: string;
+    aceApiBaseUrl?: string;
+  };
+  error?: string;
+};
+
+export type Song = {
+  id: string;
+  title?: string;
+  summary?: string;
+  prompt?: string;
+  lyrics?: string;
+  workspaceId?: string;
+  workspaceTitle?: string;
+  workspaceKind?: string;
+  bpm?: number | null;
+  key?: string | null;
+  language?: string | null;
+  duration?: number | null;
+  status?: string;
+  createdAt?: string;
+  coverPath?: string;
+  audioPath?: string;
+  audioPaths?: string[];
+  styleTags?: string;
+  folder?: string;
+  // Song Studio uses camelCase OR snake_case in different fields — keep loose:
+  [extra: string]: any;
+};
+
+export type Playlist = {
+  id: string;
+  title: string;
+  songIds?: string[];
+  songs?: Song[];
+  [extra: string]: any;
+};
+
+export const songStudioHealth = () =>
+  getJSON<SongStudioHealth>("/api/audio/song-studio/health");
+
+export const getSongLibrary = () =>
+  getJSON<{ songs: Song[] }>("/api/audio/library");
+
+export const getPlaylists = () =>
+  getJSON<{ playlists: Playlist[] }>("/api/audio/playlists");
+
+export const createPlaylist = (title: string) =>
+  postJSON<Playlist>("/api/audio/playlists", { title });
+
+export const addSongsToPlaylist = (playlistId: string, songIds: string[]) =>
+  postJSON<any>(`/api/audio/playlists/${playlistId}/songs`, { songIds });
+
+export const createWorkspace = (title: string) =>
+  postJSON<any>("/api/audio/workspaces", { title });
+
+export const renameWorkspace = (workspaceId: string, title: string) =>
+  patchJSON<any>(`/api/audio/workspaces/${workspaceId}`, { title });
+
+export const deleteSong = async (songId: string) => {
+  // Reuse the same JSON util but with DELETE method
+  const url = `/api/audio/songs/${songId}`;
+  const r = await fetch(url, { method: "DELETE" });
+  if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+  return r.json().catch(() => ({ ok: true }));
+};
+
+export const bulkDeleteSongs = (songIds: string[]) =>
+  postJSON<any>("/api/audio/songs/bulk-delete", { songIds });
+
+export const songStreamUrl = (path: string) =>
+  `/api/audio/stream?path=${encodeURIComponent(path)}`;
+
+export const songDownloadUrl = (songId: string) =>
+  `/api/audio/songs/${songId}/download`;
+
+// ---------- Phase D: MP3 export (LAME VBR V0 + embedded cover) ----------
+
+export type ExportMp3Result = {
+  ok: boolean;
+  song_id: string;
+  mp3_path: string;
+  mp3_url: string;
+  source_wav: string;
+  bitrate_avg_kbps: number;
+  size_bytes: number;
+  duration_seconds: number;
+  cover_embedded: boolean;
+  elapsed_s: number;
+};
+
+export type BulkExportMp3Result = { job_id: string; queued: number };
+
+/** Sync single-song export. Returns when the MP3 is on disk and tagged. */
+export const exportSongMp3 = (songId: string, opts: {
+  overwrite?: boolean;
+  title?: string;
+  artist?: string;
+  album?: string;
+  genre?: string;
+  comment?: string;
+} = {}) => postJSON<ExportMp3Result>(`/api/audio/songs/${songId}/export-mp3`, opts);
+
+/** Async bulk export. Returns a job_id immediately; subscribe via openJobWS. */
+export const exportSongsBulk = (songIds: string[], overwrite = false) =>
+  postJSON<BulkExportMp3Result>("/api/audio/songs/export-mp3", { song_ids: songIds, overwrite });
+
+/** Browser-download URL for an already-exported MP3 (most recent match). */
+export const exportedMp3DownloadUrl = (songId: string) =>
+  `/api/audio/songs/${songId}/export-mp3/download`;
+
 // ---------- Generation ----------
 
-export type LoraEntry = { name: string; weight: number };
+export type LoraEntry = { name: string; weight?: number; model_weight?: number };
 
 export type GenerateParams = {
   arch: string;
@@ -103,14 +399,19 @@ export type GenerateParams = {
   clip_vision?: string | null;
   loras?: LoraEntry[];
   embeddings?: string[];
+  output_name?: string | null;
   prompt: string;
   negative?: string;
+  ideogram_magic?: boolean;
+  ideogram_magic_mode?: "local" | "api" | "raw";
+  ideogram_speed_mode?: "max" | "high" | "fast";
   width: number;
   height: number;
   steps: number;
   cfg: number;
   sampler: string;
   scheduler?: string;
+  clip_skip?: number | null;
   count: number;
   seed?: number | null;
   upscale_enabled?: boolean;
@@ -118,6 +419,7 @@ export type GenerateParams = {
   upscale_model?: string | null;
   upscale_factor?: number;
   upscale_denoise?: number;
+  upscale_steps?: number;
   upscale_tile_size?: number;
 };
 
@@ -132,8 +434,139 @@ export type JobSnapshot = {
 
 export const startGenerate = (p: GenerateParams) =>
   postJSON<{ job_id: string; status: string }>("/api/generate", p);
+
+export type UpscaleParams = {
+  source_rel_path?: string | null;
+  source_path?: string | null;
+  mode: "esrgan" | "usdu";
+  upscale_model?: string | null;
+  size_mode: "factor" | "resolution";
+  factor?: number;
+  target_w?: number | null;
+  target_h?: number | null;
+  refine_arch?: string;
+  refine_checkpoint?: string | null;
+  refine_vae?: string | null;
+  steps?: number;
+  denoise?: number;
+  tile_size?: number | null;
+  cfg?: number;
+  sampler?: string;
+  scheduler?: string;
+  clip_skip?: number | null;
+  prompt?: string;
+  negative?: string;
+  seed?: number;
+  snap_mode?: string;
+  anchor_x?: string;
+  anchor_y?: string;
+};
+export const startUpscale = (p: UpscaleParams) =>
+  postJSON<{ job_id: string; status: string }>("/api/upscale", p);
+
+export type VideoUpscaleStatus = {
+  ffmpeg: string | null;
+  ffprobe: string | null;
+  rife_ncnn: string | null;
+  seedvr2_cli: string | null;
+  seedvr2_python: string | null;
+  seedvr2_model_dir: string;
+  seedvr2_models: { name: string; path: string; size_bytes: number }[];
+  upscale_model_dir: string;
+  upscale_models: { name: string; path: string; size_bytes: number }[];
+};
+
+export type VideoUpscaleParams = {
+  source_rel_path?: string | null;
+  source_path?: string | null;
+  engine: "seedvr2" | "esrgan";
+  dit_model?: string | null;
+  upscale_model?: string | null;
+  scale_mode: "resolution" | "factor";
+  upscale_factor: number;
+  resolution: number;
+  max_resolution: number;
+  batch_size: number;
+  temporal_overlap: number;
+  uniform_batch_size: boolean;
+  chunk_size?: number;
+  color_correction: "lab" | "wavelet" | "wavelet_adaptive" | "hsv" | "adain" | "none";
+  ai_detail_strength: number;
+  input_noise_scale: number;
+  latent_noise_scale: number;
+  ten_bit: boolean;
+  vae_encode_tiled: boolean;
+  vae_encode_tile_size: number;
+  vae_encode_tile_overlap: number;
+  vae_decode_tiled: boolean;
+  vae_decode_tile_size: number;
+  vae_decode_tile_overlap: number;
+  blocks_to_swap: number;
+  swap_io_components: boolean;
+  attention_mode: "sdpa" | "flash_attn_2" | "flash_attn_3" | "sageattn_2" | "sageattn_3";
+  compile_dit: boolean;
+  compile_vae: boolean;
+  compile_mode: "default" | "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs";
+  seed: number;
+  esrgan_tile_size: number;
+  esrgan_tile_overlap: number;
+  keep_audio: boolean;
+  target_fps: number;
+  interpolation: "none" | "rife_ncnn" | "ffmpeg_motion";
+};
+
+export const getVideoUpscaleStatus = () =>
+  getJSON<VideoUpscaleStatus>("/api/video-upscale/status");
+
+export const startVideoUpscale = (p: VideoUpscaleParams) =>
+  postJSON<{ job_id: string; status: string }>("/api/video-upscale", p);
+
 export const getJob = (id: string) => getJSON<JobSnapshot>(`/api/jobs/${id}`);
 export const cancelJob = (id: string) => postJSON<{ status: string }>(`/api/jobs/${id}/cancel`);
+export const ideogramMagicPrompt = (p: {
+  prompt: string;
+  negative?: string;
+  width: number;
+  height: number;
+  mode?: "local" | "api" | "raw";
+}) => postJSON<{ mode: string; prompt: string; pretty_prompt: string; aspect_ratio?: string }>("/api/ideogram4/magic-prompt", p);
+
+// ---------- Prompt Builder (deterministic, shared across image archs) ----------
+export type PromptBuilderOption = { value: string; label: string };
+export type PromptBuilderOptions = Record<"style" | "lighting" | "camera" | "mood", PromptBuilderOption[]>;
+export type PromptBuildResult = { arch: string; format: string; prompt: string; pretty: string; aspect_ratio: string };
+
+export const promptBuilderOptions = () => getJSON<PromptBuilderOptions>("/api/prompt-builder/options");
+export const promptBuilderBuild = (p: {
+  arch: string; subject: string; texts?: string[];
+  style?: string; lighting?: string; camera?: string; mood?: string;
+  negative?: string; width?: number; height?: number;
+}) => postJSON<PromptBuildResult>("/api/prompt-builder/build", p);
+
+// ---------- Video (WAN i2v) ----------
+
+export type VideoGenerateParams = {
+  arch: string;                         // "wan"
+  mode?: "i2v" | "t2v";
+  diffusion_model?: string | null;      // high-noise expert
+  diffusion_model_2?: string | null;    // low-noise expert
+  vae?: string | null;
+  text_encoders?: string[];             // slot 1 = UMT5-XXL
+  loras?: LoraEntry[];
+  prompt: string;
+  negative?: string;
+  input_image?: string | null;          // data URL / raw base64 / path
+  width: number;
+  height: number;
+  num_frames: number;
+  fps: number;
+  steps: number;
+  cfg: number;
+  seed?: number | null;
+};
+
+export const startGenerateVideo = (p: VideoGenerateParams) =>
+  postJSON<{ job_id: string; status: string }>("/api/generate/video", p);
 
 // ---------- Logs ----------
 
@@ -172,14 +605,64 @@ export type Settings = {
     // fully resident (faster) at higher OOM risk mid-step.
     flux_fast_inference_buffer_gb: number;
   };
+  // Last Generate-tab setup. Restored on next launch if the named models still
+  // exist in the current scan. Written by Generate.tsx, persisted via
+  // config_store.lastGenerate.
+  lastGenerate?: {
+    archId?: string;
+    checkpoint?: string;
+    diffusionModel?: string;
+    vae?: string;
+    te?: string[];
+    [extra: string]: any;
+  } | null;
 };
+
+// Shape saved by the Generate tab so the user's last choices are restored on next launch.
+export interface LastGenerate {
+  archId?: string;
+  checkpoint?: string;
+  diffusionModel?: string;
+  vae?: string;
+  te?: string[];
+  loras?: LoraEntry[];
+  embeddings?: string[];
+  outputName?: string;
+  prompt?: string;
+  negative?: string;
+  ideogramMagic?: boolean;
+  ideogramMagicMode?: "local" | "api" | "raw";
+  ideogramSpeedMode?: "max" | "high" | "fast";
+  preset?: string;
+  w?: number;
+  h?: number;
+  steps?: number;
+  cfg?: number;
+  sampler?: string;
+  scheduler?: string;
+  clipSkip?: number;
+  count?: number;
+  randomSeed?: boolean;
+  seed?: number;
+  upEnabled?: boolean;
+  upMode?: "esrgan" | "usdu" | "iterative";
+  upModel?: string;
+  upFactor?: number;
+  upDenoise?: number;
+  upSteps?: number;
+  upTile?: number;
+}
 
 export const getSettings   = () => getJSON<Settings>("/api/settings");
 export const patchSettings = (patch: Partial<{
   civitai: Partial<Settings["civitai"]>;
   downloads: Partial<Settings["downloads"]>;
   performance: Partial<Settings["performance"]>;
+  lastGenerate?: LastGenerate | null;
 }>) => patchJSON<Settings>("/api/settings", patch);
+
+export const saveLastGenerate = (data: LastGenerate) =>
+  patchSettings({ lastGenerate: data });
 
 // ---------- Civitai ----------
 
@@ -200,11 +683,21 @@ export type CivitaiModel = {
   tags?: string[]; creator?: CivitaiCreator; stats?: { downloadCount?: number; rating?: number; thumbsUpCount?: number };
   modelVersions?: CivitaiVersion[];
 };
-export type CivitaiSearchResult = { items: CivitaiModel[]; metadata?: { totalItems?: number; currentPage?: number; pageSize?: number; totalPages?: number; nextPage?: string } };
+export type CivitaiSearchResult = {
+  items: CivitaiModel[];
+  metadata?: {
+    totalItems?: number;
+    currentPage?: number;
+    pageSize?: number;
+    totalPages?: number;
+    nextPage?: string;
+    nextCursor?: string;
+  };
+};
 
 export type CivitaiSearchParams = {
   query?: string; types?: string; baseModels?: string;
-  nsfw?: boolean; limit?: number; page?: number; sort?: string;
+  nsfw?: boolean; limit?: number; page?: number; sort?: string; period?: string; cursor?: string;
 };
 
 export const civitaiSearch = (p: CivitaiSearchParams) => {
@@ -216,6 +709,8 @@ export const civitaiSearch = (p: CivitaiSearchParams) => {
   if (p.limit)      q.set("limit", String(p.limit));
   if (p.page)       q.set("page", String(p.page));
   if (p.sort)       q.set("sort", p.sort);
+  if (p.period)     q.set("period", p.period);
+  if (p.cursor)     q.set("cursor", p.cursor);
   return getJSON<CivitaiSearchResult>(`/api/civitai/search?${q.toString()}`);
 };
 
@@ -227,6 +722,28 @@ export const civitaiDownload   = (modelVersionId: number, fileId?: number) =>
 // ---------- Outputs ----------
 
 export type OutputDeleteResult = { deleted: string[]; errors: { path: string; error: string }[] };
+export type LatestImageOutput = {
+  rel_path: string;
+  filename: string;
+  size_bytes: number;
+  mtime: number;
+  model_label: string;
+  arch?: string | null;
+  seed?: number | null;
+  width?: number | null;
+  height?: number | null;
+};
+
+export type LatestVideoOutput = {
+  rel_path: string;
+  filename: string;
+  path?: string;
+  size_bytes: number;
+  mtime: number;
+};
+
+export type VideoImportResult = { item: LatestVideoOutput };
+export type CaptureVideoFrameResult = { item: LatestImageOutput; source: LatestVideoOutput };
 
 export async function outputFileUrl(relPath: string): Promise<string> {
   return (await base()) + "/api/outputs/file/" + relPath.split("/").map(encodeURIComponent).join("/");
@@ -234,6 +751,32 @@ export async function outputFileUrl(relPath: string): Promise<string> {
 
 export const deleteOutputs = (paths: string[]) =>
   postJSON<OutputDeleteResult>("/api/outputs/delete", { paths });
+
+export const getOutputSettings = (relPath: string) =>
+  getJSON<GenerateParams>("/api/outputs/settings/" + relPath.split("/").map(encodeURIComponent).join("/"));
+
+export const getLatestImages = (limit = 9) =>
+  getJSON<{ root: string; items: LatestImageOutput[] }>(`/api/outputs/latest-images?limit=${limit}`);
+
+export const getLatestVideos = (limit = 20) =>
+  getJSON<{ root: string; items: LatestVideoOutput[] }>(`/api/outputs/latest-videos?limit=${limit}`);
+
+export async function importVideoFile(file: File): Promise<VideoImportResult> {
+  const path = `/api/outputs/import-video?filename=${encodeURIComponent(file.name)}`;
+  const r = await fetch((await base()) + path, {
+    method: "POST",
+    headers: { "Content-Type": file.type || "application/octet-stream" },
+    body: file,
+  });
+  if (!r.ok) throw await readError(r, path);
+  return r.json() as Promise<VideoImportResult>;
+}
+
+export const importVideoPath = (path: string) =>
+  postJSON<VideoImportResult>("/api/outputs/import-video-path", { path });
+
+export const captureLastVideoFrame = (source_rel_path: string, offset_seconds = 0.12) =>
+  postJSON<CaptureVideoFrameResult>("/api/outputs/capture-last-frame", { source_rel_path, offset_seconds });
 
 export async function openJobWS(jobId: string): Promise<WebSocket> {
   let wsBase: string;

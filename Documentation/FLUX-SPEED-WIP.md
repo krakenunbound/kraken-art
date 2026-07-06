@@ -27,6 +27,13 @@ With thermals controlled, I ran per-step A/B benches via `bench_step_times.sh`
 | Patches B + C | 2468 ms | 2027 ms | 2509 ms |
 | buffer_gb=0.5 (1 streamed block) | 2187 ms | 1764 ms | 2269 ms |
 | **torch.compile + buffer_gb=0.3 (fast)** | **3445 ms** | **2988 ms** | 3371 ms |
+| **ComfyUI 0.19.4 (torch 2.11) — same workflow** | **1731 ms** | **1286 ms** | 1751 ms |
+| **comfy-kitchen apply_rope patch in our streaming path** | **~24 000 ms (!)** | (cancelled) | — |
+| **FBCache (para-attn) in our streaming path** | **~19 288 ms (10-50 s spikes)** | 10 021 ms | 17 637 ms |
+| **TRUE baseline (Claude idle, clean state)** | **2909 ms** | **2455 ms** | 2802 ms |
+| 2-stream round-robin offload (no preallocated buf) | 3009 ms | 2555 ms | 2836 ms |
+| 2-stream + preallocated GPU dest buffer | ~80 000 ms (VRAM thrash) | — | — |
+| ComfyUI 0.19.4 on same hardware | **1731 ms** | **1286 ms** | 1751 ms |
 
 **Patches B and C are net-negative on this hardware** and have been backed out.
 The min step time is essentially constant at ~2010–2030 ms across configs, but
@@ -56,9 +63,63 @@ buffer is the right shipping value.
 **Streaming offload (Phases 1–3 from 2026-05-21) at default settings is the
 shipping config.** ~73 s warm / 28 steps on FP32 flux_dev, stable.
 
-The remaining ~25 s gap to ComfyUI's 48 s warm requires custom CUDA kernels
-(their `comfy_kitchen` C++ extension). That's out of scope for a public-release
-diffusers-based app. Documented and tracked as task #46 (DEFERRED).
+### Crucial insight from 2026-05-22's experiments
+
+Every "ComfyUI-style" compute optimization we tried (comfy-kitchen apply_rope,
+FBCache, torch.compile) measured **net-negative** when stacked on top of our
+streaming partition, despite being verified-faster in isolation. The pattern:
+
+> ComfyUI's tricks assume the model is fully GPU-resident. Our streaming
+> partition keeps ~7 blocks in pinned host memory, with a mover CUDA stream
+> moving them in per step. Layering FBCache cache buffers, the comfy-kitchen
+> RoPE kernel's CUDA-stream interactions, or torch.compile's
+> guards-and-recompiles on top of that already-tight VRAM budget and
+> already-busy stream graph creates lock contention that costs more than
+> the optimization saves.
+
+**The real path to ComfyUI's 1.71 s/step:** stop streaming. Either:
+
+1. **Auto-cast FP32 → FP8 on Ampere** like ComfyUI does (their `--fp8_e4m3fn-unet`
+   default fires automatically when VRAM is tight). Cuts model size in half,
+   fits fully GPU-resident, eliminates the streaming partition entirely.
+2. **NF4 via bitsandbytes** (task #48). Cuts model to ~7 GB. Forge measured
+   3.86× speedup vs FP8. Same idea — make the streaming partition unnecessary.
+
+Once the model fits fully on GPU, all the per-step compute optimizations
+(FBCache, comfy-kitchen kernels, torch.compile) become viable and additive.
+**Layering them on top of our streaming-required setup is the wrong direction.**
+
+### Update late 2026-05-22: streaming layer is NOT the gap
+
+After porting ComfyUI's 2-stream + preallocated-buffer pattern faithfully:
+- 2-stream alone: 3009 ms median (vs 2909 baseline — noise)
+- Preallocated GPU dest buffers: catastrophic VRAM thrash (80 s/step) because
+  on a 24 GB card, doubling the streamed footprint (CPU pinned + GPU dest)
+  exceeds the activation budget.
+
+PCIe is one-transfer-at-a-time on a single card. Two CUDA streams CAN'T
+physically overlap host→device copies on the same PCIe link — they only
+help if multiple separate engines are available (multi-GPU setups, NVLink).
+On a single 3090, our existing 1-stream + per-block prefetch already
+captures the available H2D↔compute overlap.
+
+The 1180 ms/step gap to ComfyUI is **not in the streaming infrastructure**.
+Most likely candidates, in order of suspected impact:
+
+1. **diffusers' FluxTransformerBlock forward has more Python overhead than
+   ComfyUI's hand-written `DoubleStreamBlock.forward`** (more intermediate
+   tensors, more kernel launches, more `__getattr__` lookups). Would need
+   a side-by-side line count + profiler comparison.
+2. **Our bench probe overhead.** We poll `/api/jobs` every 250 ms over HTTP.
+   FastAPI handlers acquire the GIL; if they contend with the diffusion
+   thread, per-step time inflates. ComfyUI's bench used `/ws` (push) — no
+   polling load. Should re-bench with a WebSocket-based progress consumer.
+3. **PyTorch 2.6 vs 2.11.** Diffusers' SDPA dispatch and bf16 codegen got
+   real improvements between 2.6 and 2.11. ComfyUI bundles 2.11.
+
+Next experiment if we keep digging: replace `bench_step_times.sh`'s HTTP
+polling with a WebSocket subscriber to eliminate (2) as a confound. Then
+the remaining gap is (1) + (3) and we know how big each is.
 
 ## Per-step bench tool
 

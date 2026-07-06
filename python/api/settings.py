@@ -18,6 +18,7 @@ class SettingsPatch(BaseModel):
     civitai: dict[str, Any] | None = None
     downloads: dict[str, Any] | None = None
     performance: dict[str, Any] | None = None
+    lastGenerate: dict[str, Any] | None = None
 
 
 @router.patch("/settings")

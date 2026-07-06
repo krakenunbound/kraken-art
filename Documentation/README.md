@@ -17,7 +17,7 @@ F:\Kraken Art\
     pipelines/            One module per architecture (sdxl.py, flux.py, ...)
     api/                  Route handlers (gpu, deps, models, generate, logs, system)
   models/                 ~462 GB local model collection (see MODELS.md)
-  outputs/                Generated images, organized by YYYY-MM-DD
+  outputs/                Generated images/videos/audio, organized by YYYY-MM-DD
   logs/                   Sidecar logs (rotated daily)
   Logo/                   Kraken logo (PNG)
   Documentation/          This folder
@@ -46,6 +46,8 @@ See [DEV.md](DEV.md) for sidecar-only testing, manual launch, and other ops.
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — how Tauri / React / Python / diffusers fit together
 - [PIPELINES.md](PIPELINES.md) — which model architectures are supported and **what files to pick for each**
+- [WAN_VIDEO.md](WAN_VIDEO.md) — WAN 2.2 T2V/I2V setup, LoRAs, last-frame extension, and test baseline
+- [VIDEO_UPSCALE.md](VIDEO_UPSCALE.md) — video upscale engines, before/after bins, audio preservation, and recommended presets
 - [MODELS.md](MODELS.md) — what each `models/<category>` folder is for; recognized extensions
 - [DEV.md](DEV.md) — running, restarting, debugging
 - [CHANGELOG.md](CHANGELOG.md) — what's been built so far

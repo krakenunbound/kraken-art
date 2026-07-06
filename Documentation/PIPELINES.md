@@ -10,6 +10,7 @@ Which architectures work today, what files to pick for each, and what's pending.
 | **Illustrious**  | ✅ works | checkpoint  | uses `sdxl.py` (Illustrious is an SDXL fine-tune) |
 | **FLUX1**        | ✅ works | components  | `pipelines/flux.py` |
 | **ESRGAN upscale** | ✅ works | post-process | `pipelines/upscale_esrgan.py` (spandrel) |
+| **Video upscale** | ✅ works | post-process | `pipelines/video_upscale.py` (ESRGAN / SeedVR2 / RIFE) |
 | Ultimate SD Upscale | ⏳ task #15 | post-process | tile + img2img refine |
 | Iterative upscale  | ⏳ task #17 | post-process | progressive scale steps |
 | Face / region detailer | ⏳ task #16 | post-process | detect → crop → refine → paste |
@@ -17,10 +18,52 @@ Which architectures work today, what files to pick for each, and what's pending.
 | Qwen-Image       | ⏳ task #11 | components  | uses Qwen text encoder |
 | HunYuan          | ⏳ task #11 | checkpoint or components | TBD |
 | Z-Image          | ⏳ task #11 (implied) | components | uses Qwen-derived TE |
-| WAN (video)      | ⏳ task #12 | components  | i2v / t2v |
+| WAN (video)      | ✅ works | components  | `pipelines/wan_video.py` (i2v / t2v) |
 | LTX (video)      | ⏳ task #12 | checkpoint  | |
 | ACE-Step (music) | ⏳ task #13 | port from `F:\Kraken_Audio` | |
 | LuxTTS (voice)   | ⏳ task #18 | port from `F:\Kraken_Audio` | |
+
+## Video Upscale
+
+**Pipeline:** `python/pipelines/video_upscale.py`.
+
+The **Video Up** tab upscales existing video clips with two paths:
+
+- **ESRGAN preserve source** — default path. Extracts frames with ffmpeg,
+  upscales frames through Spandrel/ESRGAN models, re-encodes to H.264, and can
+  run RIFE ncnn Vulkan for 60fps interpolation.
+- **SeedVR2 cinematic detail** — diffusion reconstruction path via the local
+  SeedVR2 CLI. Kraken exposes an **AI detail strength** blend so low values
+  (`0.10-0.15`) mix SeedVR2 detail back into a preservation upscale instead of
+  fully replacing the source.
+
+The final save step can mux the original source audio back into the finished
+video when **Keep source audio** is enabled.
+
+See [VIDEO_UPSCALE.md](VIDEO_UPSCALE.md) for UI workflow, presets, and current
+3090 baseline notes.
+
+---
+
+## WAN 2.2 Video
+
+**Pipeline:** `python/pipelines/wan_video.py`.
+
+The **Video** tab supports WAN 2.2 T2V and I2V with dual high-noise / low-noise
+experts, optional WAN LoRAs on each expert, mp4 output through ffmpeg, and a
+last-frame capture workflow for extending generated clips.
+
+Use the FP8 14B variants on the local 3090:
+
+- `models/diffusion_models/WAN22/wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors`
+- `models/diffusion_models/WAN22/wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors`
+
+WAN I2V also requires a first frame image. Generated videos expose **Use last
+frame**, which captures the final decodable frame into `outputs/<date>/frames/`
+and loads it as the next I2V input.
+
+See [WAN_VIDEO.md](WAN_VIDEO.md) for model locations, LoRA notes, implementation
+details, and the July 5, 2026 verification baseline.
 
 ---
 

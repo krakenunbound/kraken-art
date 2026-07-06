@@ -1,37 +1,43 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import "./App.css";
 import logoUrl from "./assets/kraken-logo.png";
 import Generate from "./Generate";
 import Library from "./Library";
 import Logs from "./Logs";
 import SettingsModal from "./Settings";
-import { clearMemory, getDeps, getGpu, getLogs, getModels, getSettings, health, refreshModels, type DepsStatus, type GpuInfo, type Health, type ModelListing, type Settings } from "./api/sidecar";
+import { clearMemory, getDeps, getGpu, getLogs, getModels, getSettings, health, refreshModels, type DepsStatus, type GpuInfo, type ModelListing, type Settings } from "./api/sidecar";
+import Music from "./Music";
+import Video from "./Video";
+import ImageUpscale from "./ImageUpscale";
+import VideoUpscale from "./VideoUpscale";
+import Docs from "./Docs";
 import { listen } from "@tauri-apps/api/event";
+import { openPath } from "@tauri-apps/plugin-opener";
 
-type Tab = "image" | "library";
+type Tab = "image" | "video" | "upscale" | "videoUpscale" | "library" | "music" | "docs";
 
 type Status = "checking" | "up" | "down";
 
 export default function App() {
   const [sidecar, setSidecar] = useState<Status>("checking");
-  const [hp, setHp] = useState<Health | null>(null);
   const [gpu, setGpu] = useState<GpuInfo | null>(null);
   const [deps, setDeps] = useState<DepsStatus | null>(null);
   const [models, setModels] = useState<ModelListing | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [logsOpen, setLogsOpen] = useState(false);
   const [logBadge, setLogBadge] = useState(0); // count of new ERROR/WARN since last view
-  const [lastSeenLogId, setLastSeenLogId] = useState(-1);
   const [clearing, setClearing] = useState(false);
   const [clearMsg, setClearMsg] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("image");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [outputsRoot, setOutputsRoot] = useState("");
+  const lastSeenLogId = useRef(-1);
 
   async function bootstrap() {
     try {
       const h = await health();
-      setHp(h);
+      setOutputsRoot(h.outputs_root);
       setSidecar("up");
     } catch {
       setSidecar("down");
@@ -88,7 +94,7 @@ export default function App() {
   useEffect(() => {
     if (sidecar !== "up") return;
     let cancelled = false;
-    let lastId = lastSeenLogId;
+    let lastId = lastSeenLogId.current;
     async function tick() {
       try {
         const r = await getLogs(lastId >= 0 ? lastId : undefined, 200);
@@ -97,7 +103,10 @@ export default function App() {
         const warns  = r.items.filter((it) => it.level === "WARNING");
         if (errors.length > 0 && !logsOpen) setLogsOpen(true);
         if (!logsOpen) setLogBadge((b) => b + errors.length + warns.length);
-        if (r.last_id > lastId) lastId = r.last_id;
+        if (r.last_id > lastId) {
+          lastId = r.last_id;
+          lastSeenLogId.current = lastId;
+        }
       } catch { /* ignore */ }
     }
     tick();
@@ -133,6 +142,16 @@ export default function App() {
     }
   }
 
+  async function doOpenOutputs() {
+    if (!outputsRoot) return;
+    try {
+      await openPath(outputsRoot);
+    } catch (e: any) {
+      setClearMsg(`open outputs failed: ${e?.message ?? e}`);
+      setTimeout(() => setClearMsg(null), 5000);
+    }
+  }
+
   async function doRefresh() {
     setRefreshing(true);
     try {
@@ -165,7 +184,12 @@ export default function App() {
         <div className="brand"><img className="brand-logo" src={logoUrl} alt="" />Kraken Art</div>
         <nav className="tab-strip">
           <button className={"tab " + (tab === "image" ? "active" : "")} onClick={() => setTab("image")}>Image</button>
+          <button className={"tab " + (tab === "video" ? "active" : "")} onClick={() => setTab("video")}>▶ Video</button>
+          <button className={"tab " + (tab === "upscale" ? "active" : "")} onClick={() => setTab("upscale")}>↑ Upscale</button>
+          <button className={"tab " + (tab === "videoUpscale" ? "active" : "")} onClick={() => setTab("videoUpscale")}>⇡ Video Up</button>
           <button className={"tab " + (tab === "library" ? "active" : "")} onClick={() => setTab("library")}>Library</button>
+          <button className={"tab " + (tab === "music" ? "active" : "")} onClick={() => setTab("music")}>♪ Music</button>
+          <button className={"tab " + (tab === "docs" ? "active" : "")} onClick={() => setTab("docs")}>Docs</button>
         </nav>
         {sidecarPill}
         {gpuPill}
@@ -173,6 +197,9 @@ export default function App() {
         <div className="spacer" />
         {clearMsg && <span className="muted small" style={{ marginRight: 6 }}>{clearMsg}</span>}
         <button onClick={() => setSettingsOpen(true)} disabled={sidecar !== "up" || !settings} title="Settings (Civitai token, NSFW)">⚙</button>
+        <button onClick={doOpenOutputs} disabled={sidecar !== "up" || !outputsRoot} title={outputsRoot || "Open outputs folder"}>
+          Open outputs
+        </button>
         <button onClick={doClearMemory} disabled={clearing || sidecar !== "up"} title="Unload pipelines and clear CUDA cache">
           {clearing ? "Clearing…" : "Clear VRAM"}
         </button>
@@ -192,14 +219,31 @@ export default function App() {
       )}
 
       <div className="main">
-        {/* Left pane — system + model counts */}
-        <aside className="pane left-system">
+        {/* Left pane — system + model counts. Hidden on the Music tab, which
+            renders its own left sidebar (library/playlists) — otherwise there
+            would be 4 panes in the 3-column grid and the layout overflows. */}
+        <aside className={"pane left-system" + (tab === "music" || tab === "docs" ? " tab-hidden" : "")}>
           <div className="section-title">GPU</div>
           <div className="card">
             {!gpu && <div className="muted">probing…</div>}
             {gpu && (
               <div className="kv">
                 <div className="k">device</div><div className="v">{gpu.name ?? "—"}</div>
+                <div className="k">usage</div><div className="v" style={{ color: gpu.gpu_utilization_percent !== null && gpu.gpu_utilization_percent >= 90 ? "var(--c-warn)" : undefined }}>{gpu.gpu_utilization_percent !== null ? `${gpu.gpu_utilization_percent}%` : "—"}</div>
+                <div className="k">temp</div><div className="v" style={{ color: gpu.gpu_temperature_c !== null && gpu.gpu_temperature_c >= 80 ? "var(--c-bad)" : gpu.gpu_temperature_c !== null && gpu.gpu_temperature_c >= 75 ? "var(--c-warn)" : undefined }}>{gpu.gpu_temperature_c !== null ? `${gpu.gpu_temperature_c} °C` : "—"}</div>
+                <div className="k">clock</div><div className="v" style={{ color: gpu.throttled ? "var(--c-bad)" : undefined }}>{gpu.gpu_clock_mhz !== null ? `${gpu.gpu_clock_mhz}${gpu.gpu_clock_max_mhz ? ` / ${gpu.gpu_clock_max_mhz}` : ""} MHz` : "—"}</div>
+                {gpu.throttled && (
+                  <>
+                    <div className="k">throttle</div>
+                    <div className="v" style={{ color: "var(--c-bad)" }}>{gpu.throttle_reasons.length ? gpu.throttle_reasons.join(", ") : "yes"}</div>
+                  </>
+                )}
+                {gpu.power_watts !== null && (
+                  <>
+                    <div className="k">power</div>
+                    <div className="v">{gpu.power_watts}{gpu.power_limit_watts ? ` / ${gpu.power_limit_watts}` : ""} W</div>
+                  </>
+                )}
                 <div className="k">vram</div>  <div className="v">{gpu.vram_total_mb ? `${(gpu.vram_total_mb/1024).toFixed(1)} GB` : "—"}</div>
                 <div className="k">free</div>  <div className="v" style={{ color: gpu.vram_free_mb && gpu.vram_free_mb < 4096 ? "var(--c-bad)" : undefined }}>{gpu.vram_free_mb ? `${(gpu.vram_free_mb/1024).toFixed(1)} GB` : "—"}</div>
                 <div className="k">cuda</div>  <div className="v">{gpu.cuda_runtime ?? "—"}</div>
@@ -240,8 +284,13 @@ export default function App() {
 
         {/* Image tab renders BOTH center + right pane as siblings of the left aside.
             Library tab renders a single center pane (no right). */}
-        {tab === "image" && <Generate models={models} />}
-        {tab === "library" && <Library settings={settings} onModelsChanged={doRefresh} />}
+        <Generate active={tab === "image"} models={models} settings={settings} />
+        <Video active={tab === "video"} models={models} />
+        <ImageUpscale active={tab === "upscale"} models={models} settings={settings} />
+        <VideoUpscale active={tab === "videoUpscale"} />
+        <Library active={tab === "library"} settings={settings} onModelsChanged={doRefresh} />
+        {tab === "music" && <Music models={models} sidecar={sidecar} />}
+        <Docs active={tab === "docs"} />
       </div>
 
       <Logs open={logsOpen} onClose={() => { setLogsOpen(false); setLogBadge(0); }} />

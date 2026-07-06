@@ -14,7 +14,7 @@ Each architecture needs its own pipeline module under `python/pipelines/`, regis
 - [~] **FLUX1** — `pipelines/flux.py` (works but slow; FP8 T5 fix in flight — see [BUGS B-001](BUGS.md))
 - [ ] **FLUX2** — needs Gemma text encoder; pipeline + config + UI exposure (task #11)
 - [ ] **Qwen-Image** — uses Qwen2.5-VL text encoder + shared FLUX VAE
-- [ ] **Z-Image (base + turbo)** — uses Qwen-derived TE
+- [x] **Z-Image (base + turbo)** — `pipelines/z_image.py`; Qwen3-4B TE (`hidden_states[-2]`, chat-template), Flux.1-AE VAE. Turbo verified end-to-end on the 3090 (1024², 9 steps, clean image). Base path (CFG + negative) wired but not yet image-verified.
 - [ ] **HunYuan-DiT** — bilingual text encoder
 - [ ] **Stable Diffusion 3 / 3.5** — for completeness, if community asks
 
@@ -22,7 +22,7 @@ For each: ship a `model_configs/<arch>/` directory with transformer + VAE + sche
 
 ## Video
 
-- [ ] **WAN i2v / t2v** (`wan2.2_*` files) — separate UI surface (`Video` tab), per-frame progress, mp4 output
+- [x] **WAN i2v / t2v** (`wan2.2_*` files) — separate UI surface (`Video` tab), per-frame progress, mp4 output, dual high/low expert selectors, T2V without input image, I2V with first-frame input, WAN LoRA support, and last-frame capture for clip extension. Verified on the 3090 with T2V smoke -> captured PNG -> I2V continuation smoke. See [WAN_VIDEO.md](WAN_VIDEO.md).
 - [ ] **LTX video** (`ltx-2.3-22b-dev.safetensors`)
 - [ ] **HunYuan Video** when models land
 
@@ -40,6 +40,7 @@ See [reference-kraken-audio](../../C:/Users/The Kraken/.claude/projects/F--Krake
 ## Upscaling
 
 - [x] **Basic ESRGAN** (spandrel-based, single-pass) — works for SDXL + FLUX
+- [x] **Video upscaling** — `Video Up` tab with ESRGAN/RealESRGAN_x2 preserve path, SeedVR2 detail path, RIFE 60fps interpolation, before/after video bins, drag/drop import, batch delete, compare preview, and source-audio preservation.
 - [ ] **Ultimate SD Upscale** (task #15) — tile + img2img refine. All four seam-fix modes (None / Band-pass / Half-tile / Half-tile+intersections)
 - [ ] **Iterative upscale** (task #17) — progressive scale steps
 - [ ] **Face / region detailer** (task #16) — detect (YOLO face / SAM) → crop → refine → paste
@@ -67,8 +68,10 @@ These are the items that separate "works on my machine" from "ships on GitHub."
 
 - [ ] **Output gallery** — browse `outputs/YYYY-MM-DD/`, click an image to see params, re-use seed
 - [ ] **Generation history** — last N jobs with their settings, "re-run with these settings" button
+- [x] **Generated image reuse settings** — generation metadata is embedded *inside* the output PNG (A1111-style `parameters` tEXt chunk that Civitai/A1111 read, plus a lossless `kraken_settings` JSON chunk for exact field restore). Right-clicking a gallery thumbnail reads the embedded data to restore prompt/model/LoRA/sampler/dimensions/seed/upscale settings. No more `.settings.json` sidecar (legacy sidecars still read as a fallback).
 - [ ] **Workflow presets** — save current arch + model + lora + sampler combo as a named preset
-- [ ] **Per-LoRA arch tagging** — peek safetensors metadata at scan time to identify each LoRA's target arch (FLUX vs SDXL vs etc.); filter the LoRA dropdown to compatible ones for the current architecture
+- [x] **Per-LoRA architecture filtering** — LoRA dropdown is filtered to the selected architecture using scanner metadata plus filename/base-model heuristics; selected incompatible LoRAs are removed on arch switch
+- [ ] **Deep LoRA safetensors metadata extraction** — optional follow-up if filename/Civitai sidecar heuristics are not enough for older manually-copied LoRAs
 - [ ] **Logs drawer**: rate-limit identical lines (currently the orphan-poll 404 spam fills the buffer); collapsible tracebacks
 - [ ] **First-run experience**: detect that `models/` is empty and offer to symlink/copy from an existing ComfyUI install
 - [ ] **Tabs for Image / Video / Music** (task #22) — currently everything is the image surface

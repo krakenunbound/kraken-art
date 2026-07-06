@@ -4,22 +4,78 @@ import {
   type CivitaiModel, type CivitaiSearchParams, type CivitaiVersion, type CivitaiFile, type Settings,
 } from "./api/sidecar";
 
+const LIBRARY_STATE_KEY = "kraken.library.state";
 const TYPES = ["", "Checkpoint", "LORA", "TextualInversion", "VAE", "Controlnet", "Upscaler"];
 const BASE_MODELS = ["", "SDXL 1.0", "SDXL Turbo", "Pony", "Illustrious", "SD 1.5", "Flux.1 D", "Flux.1 S", "SD 3", "SD 3.5"];
 const SORTS = ["Most Downloaded", "Highest Rated", "Most Liked", "Newest"];
+const PERIODS = ["AllTime", "Year", "Month", "Week", "Day"];
 
 type DownloadState = { jobId: string; pct: number; speedMbps: number; status: string; dest?: string; error?: string };
 
-export default function Library({ settings, onModelsChanged }: { settings: Settings | null; onModelsChanged: () => void }) {
-  const [query, setQuery] = useState("");
-  const [type, setType] = useState("LORA");
-  const [baseModel, setBaseModel] = useState("");
-  const [sort, setSort] = useState("Most Downloaded");
-  const [showNsfw, setShowNsfw] = useState(!!settings?.civitai.nsfw_visible);
-  const [page, setPage] = useState(1);
+type LibraryState = {
+  query: string;
+  type: string;
+  baseModel: string;
+  sort: string;
+  period: string;
+  showNsfw?: boolean;
+  page: number;
+  cursorByPage: Record<number, string>;
+};
+
+function loadLibraryState(settings: Settings | null): LibraryState {
+  const fallback: LibraryState = {
+    query: "",
+    type: "LORA",
+    baseModel: "",
+    sort: "Most Downloaded",
+    period: "AllTime",
+    showNsfw: !!settings?.civitai.nsfw_visible,
+    page: 1,
+    cursorByPage: {},
+  };
+  try {
+    const raw = localStorage.getItem(LIBRARY_STATE_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<LibraryState>;
+    return {
+      query: typeof parsed.query === "string" ? parsed.query : fallback.query,
+      type: typeof parsed.type === "string" && TYPES.includes(parsed.type) ? parsed.type : fallback.type,
+      baseModel: typeof parsed.baseModel === "string" && BASE_MODELS.includes(parsed.baseModel) ? parsed.baseModel : fallback.baseModel,
+      sort: typeof parsed.sort === "string" && SORTS.includes(parsed.sort) ? parsed.sort : fallback.sort,
+      period: typeof parsed.period === "string" && PERIODS.includes(parsed.period) ? parsed.period : fallback.period,
+      showNsfw: typeof parsed.showNsfw === "boolean" ? parsed.showNsfw : fallback.showNsfw,
+      page: typeof parsed.page === "number" && parsed.page > 0 ? parsed.page : fallback.page,
+      cursorByPage: parsed.cursorByPage && typeof parsed.cursorByPage === "object" ? parsed.cursorByPage as Record<number, string> : fallback.cursorByPage,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function cursorFromNextPage(nextPage?: string): string | undefined {
+  if (!nextPage) return undefined;
+  try {
+    return new URL(nextPage).searchParams.get("cursor") || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export default function Library({ active, settings, onModelsChanged }: { active: boolean; settings: Settings | null; onModelsChanged: () => void }) {
+  const initial = useState(() => loadLibraryState(settings))[0];
+  const [query, setQuery] = useState(initial.query);
+  const [type, setType] = useState(initial.type);
+  const [baseModel, setBaseModel] = useState(initial.baseModel);
+  const [sort, setSort] = useState(initial.sort);
+  const [period, setPeriod] = useState(initial.period);
+  const [showNsfw, setShowNsfw] = useState(!!initial.showNsfw);
+  const [page, setPage] = useState(initial.page);
+  const [cursorByPage, setCursorByPage] = useState<Record<number, string>>(initial.cursorByPage);
 
   const [items, setItems] = useState<CivitaiModel[]>([]);
-  const [totalPages, setTotalPages] = useState(1);
+  const [totalPages, setTotalPages] = useState<number | null>(null);
+  const [hasNextPage, setHasNextPage] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -28,8 +84,15 @@ export default function Library({ settings, onModelsChanged }: { settings: Setti
   // download state by versionId → DownloadState (also lets us show progress on cards)
   const [downloads, setDownloads] = useState<Record<number, DownloadState>>({});
 
+  useEffect(() => {
+    const state: LibraryState = { query, type, baseModel, sort, period, showNsfw, page, cursorByPage };
+    localStorage.setItem(LIBRARY_STATE_KEY, JSON.stringify(state));
+  }, [query, type, baseModel, sort, period, showNsfw, page, cursorByPage]);
+
   const runSearch = useCallback(async (resetPage: boolean) => {
-    const p = resetPage ? 1 : page;
+    const requestedPage = resetPage ? 1 : page;
+    const cursor = resetPage ? undefined : cursorByPage[requestedPage];
+    const p = requestedPage > 1 && !cursor ? 1 : requestedPage;
     setLoading(true); setError(null);
     try {
       const params: CivitaiSearchParams = {
@@ -37,24 +100,32 @@ export default function Library({ settings, onModelsChanged }: { settings: Setti
         types: type || undefined,
         baseModels: baseModel || undefined,
         nsfw: showNsfw ? undefined : false,
-        limit: 24, page: p, sort,
+        limit: 24, page: p, sort, period, cursor,
       };
       const r = await civitaiSearch(params);
+      const metadata = r.metadata ?? {};
+      const nextCursor = metadata.nextCursor ?? cursorFromNextPage(metadata.nextPage);
+      const total = metadata.totalPages
+        ?? (metadata.totalItems && metadata.pageSize ? Math.ceil(metadata.totalItems / metadata.pageSize) : null);
       setItems(r.items);
-      setTotalPages(r.metadata?.totalPages ?? 1);
-      if (resetPage) setPage(1);
+      setTotalPages(total);
+      setHasNextPage(Boolean(nextCursor) || (total !== null && p < total));
+      setCursorByPage((prev) => {
+        const next = resetPage ? {} : { ...prev };
+        if (nextCursor) next[p + 1] = nextCursor;
+        return next;
+      });
+      if (resetPage || p !== requestedPage) setPage(p);
     } catch (e: any) {
       setError(String(e?.message ?? e));
       setItems([]);
     } finally {
       setLoading(false);
     }
-  }, [query, type, baseModel, sort, showNsfw, page]);
+  }, [query, type, baseModel, sort, period, showNsfw, page, cursorByPage]);
 
   // initial load + reload on page change
   useEffect(() => { runSearch(false); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [page]);
-  // first mount
-  useEffect(() => { runSearch(true); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
 
   function onSubmitFilters(e: React.FormEvent) { e.preventDefault(); runSearch(true); }
 
@@ -102,6 +173,9 @@ export default function Library({ settings, onModelsChanged }: { settings: Setti
       <select value={sort} onChange={(e) => setSort(e.target.value)} title="Sort">
         {SORTS.map((s) => <option key={s} value={s}>{s}</option>)}
       </select>
+      <select value={period} onChange={(e) => setPeriod(e.target.value)} title="Period">
+        {PERIODS.map((p) => <option key={p} value={p}>{p === "AllTime" ? "All time" : p}</option>)}
+      </select>
       <label className="row-flex" title="Allow NSFW results">
         <input type="checkbox" checked={showNsfw} onChange={(e) => setShowNsfw(e.target.checked)} /> NSFW
       </label>
@@ -110,7 +184,7 @@ export default function Library({ settings, onModelsChanged }: { settings: Setti
   );
 
   return (
-    <main className="pane center lib-root">
+    <main className={"pane center lib-root" + (active ? "" : " tab-hidden")}>
       {filtersRow}
       {error && <div className="err">{error}</div>}
 
@@ -146,8 +220,8 @@ export default function Library({ settings, onModelsChanged }: { settings: Setti
 
       <div className="lib-pagination">
         <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1 || loading}>← prev</button>
-        <span className="muted small">page {page} / {totalPages}</span>
-        <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages || loading}>next →</button>
+        <span className="muted small">page {page}{totalPages !== null ? ` / ${totalPages}` : hasNextPage ? " / …" : ""}</span>
+        <button onClick={() => setPage((p) => p + 1)} disabled={loading || !hasNextPage}>next →</button>
       </div>
 
       {detail && (
