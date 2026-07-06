@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from jobs import manager
-from pipelines import flux, ideogram4, sdxl, wan_video, z_image
+from pipelines import flux, ideogram4, krea2, sdxl, wan_video, z_image
 from pipelines.audio.engine_manager import manager as _audio_engines
 
 router = APIRouter()
@@ -41,6 +41,7 @@ class GenerateRequest(BaseModel):
 
     loras: list[LoraEntry] = Field(default_factory=list)
     embeddings: list[str] = Field(default_factory=list)
+    output_name: str | None = None
 
     # Prompt
     prompt: str = ""
@@ -70,6 +71,7 @@ class GenerateRequest(BaseModel):
     upscale_model: str | None = None
     upscale_factor: float = 2.0
     upscale_denoise: float = 0.35         # USDU/iterative only
+    upscale_steps: int = 20               # USDU only — img2img steps per tile
     upscale_tile_size: int = 512          # USDU only
 
 
@@ -83,8 +85,9 @@ _ARCH_HINTS = {
 
 
 class VideoGenerateRequest(BaseModel):
-    # Only WAN i2v in Phase 4. Dual-expert: high-noise + low-noise transformers.
+    # WAN 2.2 dual-expert video generation.
     arch: str = "wan"
+    mode: str = "i2v"                         # i2v | t2v
 
     diffusion_model: str | None = None     # high-noise expert
     diffusion_model_2: str | None = None   # low-noise expert
@@ -121,14 +124,17 @@ class IdeogramMagicPromptRequest(BaseModel):
 def generate_video(req: VideoGenerateRequest) -> dict:
     arch = req.arch.lower()
     if arch != "wan":
-        raise HTTPException(400, f"video architecture {req.arch!r} not supported (only `wan` i2v).")
+        raise HTTPException(400, f"video architecture {req.arch!r} not supported (only `wan`).")
+    mode = req.mode.lower()
+    if mode not in ("i2v", "t2v"):
+        raise HTTPException(400, "WAN video mode must be `i2v` or `t2v`.")
     if not req.diffusion_model or not req.diffusion_model_2:
-        raise HTTPException(400, "WAN i2v requires both `diffusion_model` (high-noise) and `diffusion_model_2` (low-noise) experts.")
+        raise HTTPException(400, "WAN requires both `diffusion_model` (high-noise) and `diffusion_model_2` (low-noise) experts.")
     if not req.vae:
-        raise HTTPException(400, "WAN i2v requires the WAN VAE — pick it from the VAE dropdown.")
+        raise HTTPException(400, "WAN requires the WAN VAE — pick it from the VAE dropdown.")
     if not req.text_encoders or not req.text_encoders[0]:
-        raise HTTPException(400, "WAN i2v requires the UMT5-XXL text encoder in slot 1.")
-    if not req.input_image:
+        raise HTTPException(400, "WAN requires the UMT5-XXL text encoder in slot 1.")
+    if mode == "i2v" and not req.input_image:
         raise HTTPException(400, "WAN i2v requires an input image (the first frame).")
     _release_audio_for_visual()
     ideogram4.unload()
@@ -165,6 +171,12 @@ def generate(req: GenerateRequest) -> dict:
             raise HTTPException(400, "Z-Image requires a Qwen3 text encoder in slot 1 (e.g. QWEN/qwen_3_4b.safetensors).")
         ideogram4.unload()
         job = manager.submit("image", req.model_dump(), z_image.run)
+        return {"job_id": job.id, "status": job.status}
+    if arch == "krea2":
+        if not req.diffusion_model:
+            raise HTTPException(400, "Krea 2 requires selecting a Krea 2 model (Raw or Turbo).")
+        ideogram4.unload()
+        job = manager.submit("image", req.model_dump(), krea2.run)
         return {"job_id": job.id, "status": job.status}
     if arch == "ideogram4":
         if not req.diffusion_model:

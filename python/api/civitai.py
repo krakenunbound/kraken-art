@@ -68,10 +68,107 @@ def _category_for_type(civitai_type: str) -> str | None:
     return overrides.get(civitai_type, TYPE_TO_FOLDER.get(civitai_type))
 
 
+# Arch → canonical subfolder name. Chosen so the model scanner's
+# `_detected_arch` (path-substring based, see api/models.py) tags the downloaded
+# file with the right architecture, which in turn drives the Generate-tab
+# model/LoRA filtering. Folder names may differ slightly from any pre-existing
+# manual folders, but detection is substring-based so filtering still works.
+_ARCH_SUBFOLDER: dict[str, str] = {
+    "illustrious": "Illustrious",
+    "pony":        "Pony",
+    "sdxl":        "SDXL",
+    "sd15":        "SD1.5",
+    "sd35":        "SD3.5",
+    "flux1":       "Flux1",
+    "flux2":       "Flux2",
+    "z_image":     "Z-Image",
+    "qwen_image":  "Qwen-Image",
+    "chroma":      "Chroma",
+    "hidream":     "HiDream",
+    "hunyuan":     "HunYuan",
+    "wan":         "WAN",
+    "ltx":         "LTX",
+}
+
+# Component archs read their main weight file from `diffusion_models/`, not
+# `checkpoints/`. A Civitai "Checkpoint"-type download for one of these — whether
+# an all-in-one bundle (TE+VAE baked in) or a bare transformer — is redirected
+# there so it appears in the diffusion-model picker the matching pipeline reads
+# from. The component pipelines tolerate AIO files (bundled TE/VAE keys are
+# dropped before conversion), so both the user's workflows work: AIO and split.
+_COMPONENT_ARCHS = {"flux1", "flux2", "z_image", "qwen_image", "chroma", "hidream"}
+
+
+def _detect_arch_from_version(version: dict[str, Any], model_info: dict[str, Any]) -> str | None:
+    """Best-effort architecture from Civitai version metadata. Mirrors the
+    ordering in `api/models._detected_arch` so a downloaded file and a
+    locally-scanned one resolve to the same arch."""
+    haystack = " ".join(
+        str(x or "")
+        for x in (
+            version.get("baseModel"),
+            version.get("name"),
+            version.get("model", {}).get("name"),
+            model_info.get("name"),
+        )
+    ).lower()
+    if "illustrious" in haystack or "ilust" in haystack:
+        return "illustrious"
+    if "pony" in haystack:
+        return "pony"
+    if any(s in haystack for s in ("flux-2", "flux2", "flux_2", "flux.2")):
+        return "flux2"
+    if "flux" in haystack:
+        return "flux1"
+    if any(s in haystack for s in ("qwen_image", "qwen-image", "qwenimage", "qwen image", "qwen")):
+        return "qwen_image"
+    if any(s in haystack for s in ("z_image", "zimage", "z-image", "z image")):
+        return "z_image"
+    if "hunyuan" in haystack:
+        return "hunyuan"
+    if "wan" in haystack:
+        return "wan"
+    if "ltx" in haystack:
+        return "ltx"
+    if any(s in haystack for s in ("sd 3.5", "sd3.5", "sd 3", "sd3", "stable diffusion 3")):
+        return "sd35"
+    if "chroma" in haystack:
+        return "chroma"
+    if "hidream" in haystack or "hi-dream" in haystack:
+        return "hidream"
+    if any(s in haystack for s in ("sd 1.5", "sd1.5", "stable diffusion 1.5")):
+        return "sd15"
+    if "sdxl" in haystack or "sd xl" in haystack or " xl" in haystack:
+        return "sdxl"
+    return None
+
+
+def _route_by_arch(
+    version: dict[str, Any], model_info: dict[str, Any], base_category: str
+) -> tuple[str, str | None]:
+    """Apply arch subfoldering to a download destination.
+
+    Returns `(category_path, detected_arch)`. For component archs downloaded as
+    a "Checkpoint", redirects `checkpoints` → `diffusion_models` so the file
+    lands where the pipeline that consumes it actually looks.
+    """
+    arch = _detect_arch_from_version(version, model_info)
+    if not arch:
+        return base_category, None
+    category = base_category
+    if base_category == "checkpoints" and arch in _COMPONENT_ARCHS:
+        category = "diffusion_models"
+    sub = _ARCH_SUBFOLDER.get(arch)
+    if sub:
+        category = f"{category}/{sub}"
+    return category, arch
+
+
 # ---------- search / details ----------
 
 _search_cache: dict[str, tuple[float, Any]] = {}
 _SEARCH_TTL_SEC = 60.0
+_SEARCH_AGGREGATE_MAX_PAGES = 8
 
 
 @router.get("/civitai/search")
@@ -83,8 +180,17 @@ async def search(
     limit: int = 20,
     page: int = 1,
     sort: str = "Most Downloaded",
+    period: str = "AllTime",
+    cursor: str | None = None,
 ) -> dict[str, Any]:
-    params: dict[str, Any] = {"limit": str(limit), "page": str(page), "sort": sort}
+    params: dict[str, Any] = {"limit": str(limit), "sort": sort}
+    if period:
+        params["period"] = period
+    if cursor:
+        params["cursor"] = cursor
+    # Civitai rejects `page` when query search is used and cursor pagination is
+    # now the reliable path for large model result sets. Keep accepting `page`
+    # from our UI for local display, but do not forward it upstream.
     if query:
         params["query"] = query
     if types:
@@ -104,9 +210,36 @@ async def search(
             r = await client.get(url, headers=_auth_headers())
         except httpx.RequestError as e:
             raise HTTPException(502, f"Civitai unreachable: {e}")
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"Civitai: {r.text[:300]}")
-    data = r.json()
+        if r.status_code != 200:
+            raise HTTPException(r.status_code, f"Civitai: {r.text[:300]}")
+        data = r.json()
+
+        # Civitai cursor pages can be sparse when query + type/baseModel filters
+        # are combined. Pull a few cursors ahead so one UI page is filled with
+        # actual matches instead of showing "no results" while more cursors exist.
+        pages_fetched = 1
+        while len(data.get("items") or []) < limit and pages_fetched < _SEARCH_AGGREGATE_MAX_PAGES:
+            next_cursor = (data.get("metadata") or {}).get("nextCursor")
+            if not next_cursor:
+                break
+            next_params = dict(params)
+            next_params["cursor"] = next_cursor
+            next_url = CIVITAI_BASE + "/models?" + urlencode(next_params, doseq=True)
+            try:
+                next_r = await client.get(next_url, headers=_auth_headers())
+            except httpx.RequestError as e:
+                raise HTTPException(502, f"Civitai unreachable: {e}")
+            if next_r.status_code != 200:
+                break
+            next_data = next_r.json()
+            data["items"] = (data.get("items") or []) + (next_data.get("items") or [])
+            data["metadata"] = next_data.get("metadata") or data.get("metadata") or {}
+            pages_fetched += 1
+            if not (next_data.get("metadata") or {}).get("nextCursor"):
+                break
+
+        if len(data.get("items") or []) > limit:
+            data["items"] = data["items"][:limit]
     _search_cache[url] = (time.time(), data)
     return data
 
@@ -235,6 +368,16 @@ async def start_download(req: DownloadRequest) -> dict[str, Any]:
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"Civitai version: {r.text[:300]}")
     version = r.json()
+    model_info: dict[str, Any] = {}
+    model_id = version.get("modelId")
+    if model_id:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                model_resp = await client.get(f"{CIVITAI_BASE}/models/{model_id}", headers=_auth_headers())
+                if model_resp.status_code == 200:
+                    model_info = model_resp.json()
+            except httpx.RequestError:
+                model_info = {}
 
     files = version.get("files") or []
     if not files:
@@ -252,6 +395,9 @@ async def start_download(req: DownloadRequest) -> dict[str, Any]:
         raise HTTPException(
             400, f"Civitai type {civitai_type!r} has no folder mapping (override with category_override)."
         )
+    detected_arch: str | None = None
+    if not req.category_override and category in ("checkpoints", "loras", "embeddings"):
+        category, detected_arch = _route_by_arch(version, model_info, category)
 
     target_dir = MODELS_ROOT / category
     filename = _safe_filename(f_obj.get("name") or f"civitai_{f_obj.get('id')}.safetensors")
@@ -267,13 +413,15 @@ async def start_download(req: DownloadRequest) -> dict[str, Any]:
     metadata = {
         "civitai_model_id":   version.get("modelId"),
         "civitai_version_id": version.get("id"),
-        "name":               version.get("model", {}).get("name"),
+        "name":               version.get("model", {}).get("name") or model_info.get("name"),
         "version_name":       version.get("name"),
         "baseModel":          version.get("baseModel"),
         "trainedWords":       version.get("trainedWords", []),
         "type":               civitai_type,
+        "detected_arch":      detected_arch,
+        "description":        version.get("description") or model_info.get("description") or version.get("model", {}).get("description"),
         "nsfw":               version.get("model", {}).get("nsfw", False),
-        "creator":            version.get("creator") or {},
+        "creator":            version.get("creator") or model_info.get("creator") or {},
         "downloadUrl":        download_url,
         "fileName":           f_obj.get("name"),
         "fileId":             f_obj.get("id"),
@@ -295,4 +443,4 @@ async def start_download(req: DownloadRequest) -> dict[str, Any]:
         },
         fn=_download_job,
     )
-    return {"job_id": job.id, "dest": str(dest), "category": category}
+    return {"job_id": job.id, "dest": str(dest), "category": category, "detected_arch": detected_arch}

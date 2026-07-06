@@ -17,6 +17,7 @@ from PIL import Image
 
 from config import MODELS_ROOT, OUTPUTS_ROOT
 from pipelines.load_utils import unload_pipeline
+from pipelines.output_metadata import build_output_stem, save_png_with_metadata
 
 log = logging.getLogger("kraken.sdxl")
 
@@ -53,17 +54,37 @@ def _get_scheduler(name: str):
     """Map our sampler names to diffusers scheduler classes."""
     from diffusers import (
         DDIMScheduler,
+        DEISMultistepScheduler,
+        DPMSolverSDEScheduler,
         DPMSolverMultistepScheduler,
+        DPMSolverSinglestepScheduler,
         EulerAncestralDiscreteScheduler,
         EulerDiscreteScheduler,
+        HeunDiscreteScheduler,
+        KDPM2AncestralDiscreteScheduler,
+        KDPM2DiscreteScheduler,
+        LCMScheduler,
+        LMSDiscreteScheduler,
+        PNDMScheduler,
         UniPCMultistepScheduler,
     )
     n = name.lower()
-    if n in ("euler",):                          return EulerDiscreteScheduler
-    if n in ("euler_a", "euler_ancestral"):      return EulerAncestralDiscreteScheduler
-    if n in ("ddim",):                           return DDIMScheduler
-    if n in ("unipc",):                          return UniPCMultistepScheduler
-    if n in ("dpmpp_2m", "dpm++_2m"):            return DPMSolverMultistepScheduler
+    n = n.replace(" ", "_").replace("+", "p")
+    if n in ("euler",):                                      return EulerDiscreteScheduler
+    if n in ("euler_a", "euler_ancestral"):                  return EulerAncestralDiscreteScheduler
+    if n in ("heun",):                                       return HeunDiscreteScheduler
+    if n in ("lms",):                                        return LMSDiscreteScheduler
+    if n in ("ddim",):                                       return DDIMScheduler
+    if n in ("pndm",):                                       return PNDMScheduler
+    if n in ("unipc",):                                      return UniPCMultistepScheduler
+    if n in ("deis",):                                       return DEISMultistepScheduler
+    if n in ("lcm",):                                        return LCMScheduler
+    if n in ("dpm_2", "dpm2", "kdpm_2", "kdpm2"):           return KDPM2DiscreteScheduler
+    if n in ("dpm_2_a", "dpm2_a", "kdpm_2_a", "kdpm2_a"):   return KDPM2AncestralDiscreteScheduler
+    if n in ("dpmpp_2m", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu",
+             "dpm++_2m", "dpmpp_3m", "dpmpp_3m_sde"):       return DPMSolverMultistepScheduler
+    if n in ("dpmpp_sde", "dpmpp_sde_gpu", "dpm++_sde"):     return DPMSolverSDEScheduler
+    if n in ("dpmpp_2s_a", "dpm++_2s_a"):                    return DPMSolverSinglestepScheduler
     return EulerDiscreteScheduler
 
 
@@ -198,6 +219,9 @@ def _thumbnail_b64(img: Image.Image, max_side: int = 320) -> str:
 def unload() -> dict:
     """Tear down the cached pipeline + free CUDA cache. Returns counts for logging."""
     global _pipeline, _pipeline_key, _loaded_loras, _loaded_embeddings
+    global _img2img_pipe, _img2img_key
+    _img2img_pipe = None
+    _img2img_key = None
     had_pipe = _pipeline is not None
     n_loras = len(_loaded_loras)
     n_emb = len(_loaded_embeddings)
@@ -218,6 +242,15 @@ def unload() -> dict:
 def _adapter_name(lora_name: str) -> str:
     # Adapter names must be safe identifiers for diffusers' adapter registry.
     return "lora_" + "".join(ch if ch.isalnum() else "_" for ch in lora_name)[:48]
+
+
+def _lora_model_weight(entry: dict) -> float:
+    value = entry.get("model_weight")
+    if value is None:
+        value = entry.get("weight")
+    if value is None:
+        value = 1.0
+    return float(value)
 
 
 def _apply_loras(pipe, loras: list[dict]) -> None:
@@ -250,7 +283,7 @@ def _apply_loras(pipe, loras: list[dict]) -> None:
         try:
             pipe.load_lora_weights(str(path.parent), weight_name=path.name, adapter_name=adapter)
             names.append(adapter)
-            weights.append(float(entry.get("weight", 1.0)))
+            weights.append(_lora_model_weight(entry))
             log.info("loaded LoRA %s @ %.2f", entry["name"], weights[-1])
         except Exception as e:
             log.warning("failed to load LoRA %s: %s", entry["name"], e)
@@ -282,6 +315,61 @@ def _apply_embeddings(pipe, embeddings: list[str]) -> None:
             log.warning("failed to load embedding %s: %s", name, e)
 
 
+_img2img_pipe: Any | None = None
+_img2img_key: tuple | None = None
+
+
+def make_refiner(
+    checkpoint: str,
+    vae: str | None,
+    *,
+    sampler: str = "dpmpp_2m",
+    scheduler: str = "karras",
+    prompt: str = "",
+    negative: str = "",
+    cfg: float = 6.0,
+    clip_skip: int | None = None,
+):
+    """Build an SDXL img2img tile-refiner for USDU.
+
+    Reuses the already-loaded txt2img checkpoint's components (same nn.Modules,
+    so no extra VRAM) wrapped in StableDiffusionXLImg2ImgPipeline. Returns a
+    closure `refine(tile, *, steps, denoise, seed) -> PIL.Image`.
+    """
+    global _img2img_pipe, _img2img_key
+    from diffusers import StableDiffusionXLImg2ImgPipeline
+
+    base = _ensure_pipeline(checkpoint, vae)
+    _set_scheduler(base, sampler or "dpmpp_2m", scheduler or "karras")
+
+    key = (_pipeline_key, "img2img")
+    if _img2img_pipe is None or _img2img_key != key:
+        _img2img_pipe = StableDiffusionXLImg2ImgPipeline(**base.components)
+        _img2img_pipe.set_progress_bar_config(disable=True)
+        _img2img_key = key
+    pipe = _img2img_pipe
+    pipe.scheduler = base.scheduler  # pick up sampler/scheduler changes between runs
+    device = _device()
+
+    def refine(tile: Image.Image, *, steps: int, denoise: float, seed: int) -> Image.Image:
+        # diffusers img2img runs int(steps*strength) actual steps; bump so even a
+        # low denoise does at least a few real steps.
+        gen = torch.Generator(device=device).manual_seed(int(seed) & 0x7FFFFFFF)
+        out = pipe(
+            prompt=prompt or "",
+            negative_prompt=negative or None,
+            image=tile,
+            strength=float(denoise),
+            num_inference_steps=int(steps),
+            guidance_scale=float(cfg),
+            clip_skip=clip_skip,
+            generator=gen,
+        )
+        return out.images[0]
+
+    return refine
+
+
 def run(job) -> dict:
     """Job entry. job.params shape matches the GenerateRequest model."""
     from pipelines import flux as flux_mod
@@ -299,12 +387,13 @@ def run(job) -> dict:
     height = int(p.get("height") or 1024)
     steps  = int(p.get("steps") or 30)
     cfg    = float(p.get("cfg") or 7.0)
+    clip_skip = int(p.get("clip_skip") or 0) or None
     count  = int(p.get("count") or 1)
     seed   = p.get("seed")
 
     out_dir = OUTPUTS_ROOT / time.strftime("%Y-%m-%d")
     out_dir.mkdir(parents=True, exist_ok=True)
-    base_stem = time.strftime("%H%M%S") + "-" + job.id[:8]
+    base_stem = build_output_stem(p, job.id)
 
     saved: list[dict] = []
     device = _device()
@@ -323,6 +412,7 @@ def run(job) -> dict:
             height=height,
             num_inference_steps=steps,
             guidance_scale=cfg,
+            clip_skip=clip_skip,
             generator=generator,
             callback_on_step_end=_make_callback(job, steps, i, count),
         )
@@ -330,7 +420,7 @@ def run(job) -> dict:
 
         fname = f"{base_stem}-{i:02d}.png"
         fpath = out_dir / fname
-        img.save(fpath, format="PNG")
+        save_png_with_metadata(img, fpath, p, int(per_seed))
         entry = {
             "path": str(fpath),
             "filename": fname,
@@ -339,21 +429,39 @@ def run(job) -> dict:
             "height": height,
         }
 
-        # Optional ESRGAN upscale (USDU + iterative still pending — task #15, #17)
+        # Optional upscale — ESRGAN (fast) or USDU (tile + img2img refine, same model).
         if p.get("upscale_enabled") and p.get("upscale_model"):
             mode = (p.get("upscale_mode") or "esrgan").lower()
-            if mode == "esrgan":
-                try:
+            factor = float(p.get("upscale_factor", 2.0))
+            try:
+                if mode == "usdu":
+                    from pipelines import usdu
+                    refiner = make_refiner(
+                        p["checkpoint"], p.get("vae"),
+                        sampler=p.get("sampler") or "dpmpp_2m",
+                        scheduler=p.get("scheduler") or "karras",
+                        prompt=p.get("prompt", ""), negative=p.get("negative", ""),
+                        cfg=float(p.get("cfg") or 6.0), clip_skip=clip_skip,
+                    )
+                    res = usdu.run_usdu(
+                        img, max(8, round(width * factor)), max(8, round(height * factor)),
+                        upscale_model=p["upscale_model"], refine_fn=refiner,
+                        steps=int(p.get("upscale_steps") or 20),
+                        denoise=float(p.get("upscale_denoise") or 0.2),
+                        seed=int(per_seed),
+                        tile_size=p.get("upscale_tile_size") or None,
+                        progress=usdu.job_progress(job, i, count),
+                    )
+                    up = res["image"]
+                else:
                     from pipelines import upscale_esrgan
-                    up = upscale_esrgan.upscale(img, p["upscale_model"], float(p.get("upscale_factor", 2.0)))
-                    up_path = out_dir / f"{base_stem}-{i:02d}-up.png"
-                    up.save(up_path, format="PNG")
-                    entry["upscaled_path"] = str(up_path)
-                    img = up  # preview the upscaled version
-                except Exception as e:
-                    log.warning("upscale failed: %s", e)
-            else:
-                log.info("upscale mode '%s' is pending (task #15/#17), skipping", mode)
+                    up = upscale_esrgan.upscale(img, p["upscale_model"], factor)
+                up_path = out_dir / f"{base_stem}-{i:02d}-up.png"
+                save_png_with_metadata(up, up_path, p, int(per_seed))
+                entry["upscaled_path"] = str(up_path)
+                img = up  # preview the upscaled version
+            except Exception as e:
+                log.warning("upscale (%s) failed: %s", mode, e)
 
         rel_path = fpath.relative_to(OUTPUTS_ROOT).as_posix()
         entry["rel_path"] = rel_path

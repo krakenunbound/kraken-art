@@ -13,6 +13,10 @@ models/
 outputs/
 # Local dequant cache (e.g. T5 bf16 cache file). Rebuilt on first load.
 _kraken_cache/
+# Local HF/model caches and unpacked model trees.
+hf_cache/
+Ideogram/
+krea2/
 
 # ---- Build artifacts / dependencies -----------------------------------------
 node_modules/
@@ -32,6 +36,8 @@ python/__pycache__/
 # Bytecode-style files PyInstaller would produce if we ever bundle.
 *.spec
 build/
+# External tool installs such as SeedVR2 live here locally.
+external/
 
 # ---- User-local state (NEVER commit) ----------------------------------------
 # User settings include the Civitai API token field. Even if blank, keep
@@ -46,6 +52,16 @@ python/sidecar.err
 logs/
 *.log
 model-copy.log
+
+# ---- Local scratch / generated work -----------------------------------------
+backups/
+tmp/
+work/
+local-ai-audio-studio-docs/
+mcps/
+*.bak
+gemini.md
+Image Models to Deploy.txt
 
 # ---- Editor / OS noise ------------------------------------------------------
 .vscode/*

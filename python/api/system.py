@@ -4,7 +4,7 @@ import gc
 import logging
 from fastapi import APIRouter
 
-from pipelines import flux, sdxl, upscale_esrgan
+from pipelines import flux, ideogram4, sdxl, upscale_esrgan, z_image, wan_video
 
 log = logging.getLogger("kraken.system")
 router = APIRouter()
@@ -27,13 +27,31 @@ def clear_memory() -> dict:
     before = _vram_free_mb()
 
     details = {}
-    # Each pipeline owns its unload; orchestrate them here.
-    for name, mod in [("sdxl", sdxl), ("flux", flux), ("upscale", upscale_esrgan)]:
+    # Each pipeline owns its unload; orchestrate them all here. Every image/video
+    # arch must be listed — a missing one (e.g. z_image) means Clear VRAM leaves
+    # that model resident, which is exactly the bug this covers.
+    for name, mod in [
+        ("sdxl", sdxl),
+        ("flux", flux),
+        ("z_image", z_image),
+        ("ideogram4", ideogram4),
+        ("wan_video", wan_video),
+        ("upscale", upscale_esrgan),
+    ]:
         try:
             details[name] = mod.unload()
         except Exception as e:
             log.warning("%s.unload raised: %s", name, e)
             details[name] = {"error": str(e)}
+
+    # Also stop any running audio engine (its VRAM lives in a child process).
+    try:
+        from pipelines.audio.engine_manager import manager as audio_engines
+        audio_engines.stop_all()
+        details["audio_engines"] = "stopped"
+    except Exception as e:
+        log.warning("audio engine stop_all raised: %s", e)
+        details["audio_engines"] = {"error": str(e)}
 
     gc.collect()
     try:

@@ -12,6 +12,7 @@ REQUIRED = [
     ("transformers", ">=4.46",  "pip install -U transformers"),
     ("accelerate",   ">=1.2",   "pip install -U accelerate"),
     ("safetensors",  ">=0.4",   "pip install -U safetensors"),
+    ("bitsandbytes", ">=0.49",  "pip install -U bitsandbytes"),
     ("fastapi",      ">=0.115", "pip install -U fastapi"),
     ("uvicorn",      ">=0.32",  "pip install -U 'uvicorn[standard]'"),
     ("Pillow",       ">=10",    "pip install -U Pillow"),

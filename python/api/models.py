@@ -51,6 +51,8 @@ def _detected_arch(path: Path, metadata: dict) -> str | None:
         return "qwen_image"
     if any(s in haystack for s in ("z_image", "zimage", "z-image")):
         return "z_image"
+    if any(s in haystack for s in ("krea_2", "krea2", "krea-2")):
+        return "krea2"
     if any(s in haystack for s in ("ideogram", "ideogram-4")):
         return "ideogram4"
     if "hunyuan" in haystack:
@@ -229,11 +231,13 @@ def _virtual_ideogram_models() -> list[dict]:
             "base_model": "Ideogram 4",
             "source_type": "local_snapshot" if local_ready else "huggingface_gated",
             "detected_arch": "ideogram4",
+            "experimental": quant == "fp8",
+            "disabled_by_default": quant == "fp8",
             "warning": (
                 "Quality 48 + Speed: High gives near-max quality in ~2 min on a 3090 (adaptive cache). "
                 "Drop to Turbo 12 for fast drafts."
                 if quant == "nf4"
-                else "FP8 is not the preferred RTX 3090 path; use NF4 unless you are doing a controlled comparison."
+                else "Guarded experimental: FP8 hard-crashed during isolated-worker cold load on this Windows RTX 3090 stack. Use NF4 for normal local Ideogram generation."
             ),
             "recommended_settings": {
                 "cfg": 7.0,
@@ -322,6 +326,20 @@ def _virtual_ideogram_models() -> list[dict]:
     ]
 
 
+def _virtual_krea2_models() -> list[dict]:
+    """Expose Krea 2 diffusers-folder models (Raw / Turbo) in the model selector.
+
+    Krea 2 ships as a self-contained diffusers folder rather than a single-file
+    checkpoint, so the file scanner won't see it. The pipeline module owns the
+    folder discovery; we just surface whatever it finds.
+    """
+    try:
+        from pipelines import krea2
+        return krea2.discover_models()
+    except Exception:
+        return []
+
+
 def _build_listing() -> dict:
     cats: dict[str, list[dict]] = {}
     counts: dict[str, int] = {}
@@ -333,6 +351,7 @@ def _build_listing() -> dict:
             items.extend(_scan_audio_external())
         if cat == "diffusion_models":
             items.extend(_virtual_ideogram_models())
+            items.extend(_virtual_krea2_models())
         cats[cat] = items
         counts[cat] = len(items)
     return {

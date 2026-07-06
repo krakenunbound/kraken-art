@@ -8,9 +8,13 @@ import SettingsModal from "./Settings";
 import { clearMemory, getDeps, getGpu, getLogs, getModels, getSettings, health, refreshModels, type DepsStatus, type GpuInfo, type ModelListing, type Settings } from "./api/sidecar";
 import Music from "./Music";
 import Video from "./Video";
+import ImageUpscale from "./ImageUpscale";
+import VideoUpscale from "./VideoUpscale";
+import Docs from "./Docs";
 import { listen } from "@tauri-apps/api/event";
+import { openPath } from "@tauri-apps/plugin-opener";
 
-type Tab = "image" | "video" | "library" | "music";
+type Tab = "image" | "video" | "upscale" | "videoUpscale" | "library" | "music" | "docs";
 
 type Status = "checking" | "up" | "down";
 
@@ -27,11 +31,13 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("image");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [outputsRoot, setOutputsRoot] = useState("");
   const lastSeenLogId = useRef(-1);
 
   async function bootstrap() {
     try {
-      await health();
+      const h = await health();
+      setOutputsRoot(h.outputs_root);
       setSidecar("up");
     } catch {
       setSidecar("down");
@@ -136,6 +142,16 @@ export default function App() {
     }
   }
 
+  async function doOpenOutputs() {
+    if (!outputsRoot) return;
+    try {
+      await openPath(outputsRoot);
+    } catch (e: any) {
+      setClearMsg(`open outputs failed: ${e?.message ?? e}`);
+      setTimeout(() => setClearMsg(null), 5000);
+    }
+  }
+
   async function doRefresh() {
     setRefreshing(true);
     try {
@@ -169,8 +185,11 @@ export default function App() {
         <nav className="tab-strip">
           <button className={"tab " + (tab === "image" ? "active" : "")} onClick={() => setTab("image")}>Image</button>
           <button className={"tab " + (tab === "video" ? "active" : "")} onClick={() => setTab("video")}>▶ Video</button>
+          <button className={"tab " + (tab === "upscale" ? "active" : "")} onClick={() => setTab("upscale")}>↑ Upscale</button>
+          <button className={"tab " + (tab === "videoUpscale" ? "active" : "")} onClick={() => setTab("videoUpscale")}>⇡ Video Up</button>
           <button className={"tab " + (tab === "library" ? "active" : "")} onClick={() => setTab("library")}>Library</button>
           <button className={"tab " + (tab === "music" ? "active" : "")} onClick={() => setTab("music")}>♪ Music</button>
+          <button className={"tab " + (tab === "docs" ? "active" : "")} onClick={() => setTab("docs")}>Docs</button>
         </nav>
         {sidecarPill}
         {gpuPill}
@@ -178,6 +197,9 @@ export default function App() {
         <div className="spacer" />
         {clearMsg && <span className="muted small" style={{ marginRight: 6 }}>{clearMsg}</span>}
         <button onClick={() => setSettingsOpen(true)} disabled={sidecar !== "up" || !settings} title="Settings (Civitai token, NSFW)">⚙</button>
+        <button onClick={doOpenOutputs} disabled={sidecar !== "up" || !outputsRoot} title={outputsRoot || "Open outputs folder"}>
+          Open outputs
+        </button>
         <button onClick={doClearMemory} disabled={clearing || sidecar !== "up"} title="Unload pipelines and clear CUDA cache">
           {clearing ? "Clearing…" : "Clear VRAM"}
         </button>
@@ -200,7 +222,7 @@ export default function App() {
         {/* Left pane — system + model counts. Hidden on the Music tab, which
             renders its own left sidebar (library/playlists) — otherwise there
             would be 4 panes in the 3-column grid and the layout overflows. */}
-        <aside className={"pane left-system" + (tab === "music" ? " tab-hidden" : "")}>
+        <aside className={"pane left-system" + (tab === "music" || tab === "docs" ? " tab-hidden" : "")}>
           <div className="section-title">GPU</div>
           <div className="card">
             {!gpu && <div className="muted">probing…</div>}
@@ -264,8 +286,11 @@ export default function App() {
             Library tab renders a single center pane (no right). */}
         <Generate active={tab === "image"} models={models} settings={settings} />
         <Video active={tab === "video"} models={models} />
+        <ImageUpscale active={tab === "upscale"} models={models} settings={settings} />
+        <VideoUpscale active={tab === "videoUpscale"} />
         <Library active={tab === "library"} settings={settings} onModelsChanged={doRefresh} />
         {tab === "music" && <Music models={models} sidecar={sidecar} />}
+        <Docs active={tab === "docs"} />
       </div>
 
       <Logs open={logsOpen} onClose={() => { setLogsOpen(false); setLogBadge(0); }} />

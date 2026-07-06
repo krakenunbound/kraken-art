@@ -25,7 +25,7 @@ from PIL import Image
 
 from config import OUTPUTS_ROOT, ROOT
 from pipelines.ideogram4_magic import preview_local_magic_prompt
-from pipelines.output_metadata import save_png_with_metadata
+from pipelines.output_metadata import build_output_stem, save_png_with_metadata
 
 log = logging.getLogger("kraken.ideogram4")
 
@@ -621,13 +621,14 @@ def _generate_cached(pipe, prompt, height, width, preset, seed, *,
 
 
 def _run_inprocess(job) -> dict:
-    from pipelines import flux as flux_mod, sdxl as sdxl_mod, wan_video as wan_mod, z_image as zi_mod
+    from pipelines import flux as flux_mod, krea2 as krea2_mod, sdxl as sdxl_mod, wan_video as wan_mod, z_image as zi_mod
 
     p = job.params
     cached_before, quant, _, _, _ = _pipeline_cache_state(p.get("diffusion_model"))
 
     sdxl_mod.unload()
     flux_mod.unload()
+    krea2_mod.unload()
     zi_mod.unload()
     wan_mod.unload()
     gc.collect()
@@ -685,7 +686,7 @@ def _run_inprocess(job) -> dict:
 
     out_dir = OUTPUTS_ROOT / time.strftime("%Y-%m-%d")
     out_dir.mkdir(parents=True, exist_ok=True)
-    base_stem = time.strftime("%H%M%S") + "-" + job.id[:8]
+    base_stem = build_output_stem(p, job.id)
 
     saved: list[dict] = []
     for i in range(count):
@@ -935,46 +936,45 @@ def _run_with_persistent_worker(job) -> dict:
         raise RuntimeError(f"Ideogram worker exited with code {code}. Last output: {last_output}")
 
 
-def run(job) -> dict:
-    """Run Ideogram. DEFAULT IS IN-PROCESS.
+def _is_worker_hard_crash(error: Exception) -> bool:
+    text = str(error).lower()
+    return (
+        "ideogram worker exited with code" in text
+        and (
+            "3221225477" in text
+            or "-1073741819" in text
+            or "0xc0000005" in text
+            or "access violation" in text
+        )
+    )
 
-    Hard-won lesson (2026-06-17): the subprocess worker was added to isolate
-    CUDA crashes, but on Windows it CAUSES them. The sidecar process holds a
-    CUDA context (the GPU panel calls torch.cuda; FLUX/SDXL also use CUDA in
-    this process). When it then spawns a child worker that does bitsandbytes
-    4-bit weight construction on the SAME GPU, the child dies with a fatal
-    Windows access violation (exit 0xC0000005) at the bnb Linear4bit build —
-    reproduced deterministically. Running in-process keeps a single CUDA
-    context, which bitsandbytes handles normally, so it just works.
 
-    The worker remains available for deliberate isolated experimental-quant
-    testing via KRAKEN_IDEOGRAM4_USE_WORKER=1.
-    """
-    if os.environ.get("KRAKEN_IDEOGRAM4_USE_WORKER") != "1":
-        return _run_inprocess(job)
+def _emit_worker_retry(job, message: str) -> None:
+    job.progress.step = 0
+    job.progress.total_steps = 0
+    job.progress.message = message
+    job.emit({
+        "type": "progress",
+        "step": 0,
+        "total_steps": 0,
+        "image_index": 0,
+        "total_images": int(job.params.get("count") or 1),
+        "message": message,
+    })
 
-    from pipelines import flux as flux_mod, sdxl as sdxl_mod, wan_video as wan_mod, z_image as zi_mod
 
-    # Release other resident visual pipelines in the sidecar before the child grabs VRAM.
-    sdxl_mod.unload()
-    flux_mod.unload()
-    zi_mod.unload()
-    wan_mod.unload()
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    if os.environ.get("KRAKEN_IDEOGRAM4_ONESHOT_WORKER") != "1":
-        return _run_with_persistent_worker(job)
-
+def _run_one_shot_worker(job, params: dict | None = None, *, label: str = "") -> dict:
+    worker_params = dict(params or job.params)
     tmp_dir = ROOT / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    spec_path = tmp_dir / f"ideogram-job-{job.id}.json"
-    spec_path.write_text(json.dumps({"id": job.id, "params": job.params}, ensure_ascii=False), encoding="utf-8")
+    safe_label = "".join(ch if ch.isalnum() else "-" for ch in label).strip("-")
+    suffix = f"-{safe_label}" if safe_label else ""
+    spec_path = tmp_dir / f"ideogram-job-{job.id}{suffix}.json"
+    spec_path.write_text(json.dumps({"id": job.id, "params": worker_params}, ensure_ascii=False), encoding="utf-8")
 
     cmd = [sys.executable, "-u", str(WORKER_SCRIPT), str(spec_path)]
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    log.info("starting Ideogram worker for job %s", job.id)
+    log.info("starting Ideogram worker for job %s%s", job.id, f" ({label})" if label else "")
     proc = subprocess.Popen(
         cmd,
         cwd=str(ROOT),
@@ -1012,7 +1012,7 @@ def run(job) -> dict:
                     proc.kill()
                 return {
                     "kind": "image",
-                    "count_requested": int(job.params.get("count") or 1),
+                    "count_requested": int(worker_params.get("count") or 1),
                     "count_produced": 0,
                     "outputs": [],
                     "cancelled": True,
@@ -1054,3 +1054,70 @@ def run(job) -> dict:
             spec_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def run(job) -> dict:
+    """Run Ideogram in an isolated one-shot worker by default.
+
+    Ideogram 4 NF4 can hard-crash the Python interpreter during bitsandbytes'
+    4-bit module construction. A crash in-process takes the whole sidecar down,
+    which loses the job websocket and makes the app look broken. The one-shot
+    worker keeps that failure mode contained: a bad Ideogram load becomes a
+    normal failed job while the sidecar survives. Set
+    KRAKEN_IDEOGRAM4_INPROCESS=1 only when debugging the Ideogram package itself.
+    Set KRAKEN_IDEOGRAM4_PERSISTENT_WORKER=1 to reuse a worker between jobs.
+    """
+    if os.environ.get("KRAKEN_IDEOGRAM4_INPROCESS") == "1" or os.environ.get("KRAKEN_IDEOGRAM4_USE_WORKER") == "0":
+        return _run_inprocess(job)
+
+    from pipelines import flux as flux_mod, krea2 as krea2_mod, sdxl as sdxl_mod, wan_video as wan_mod, z_image as zi_mod
+
+    # Release other resident visual pipelines in the sidecar before the child grabs VRAM.
+    sdxl_mod.unload()
+    flux_mod.unload()
+    krea2_mod.unload()
+    zi_mod.unload()
+    wan_mod.unload()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    _, quant, _, _, _ = _pipeline_cache_state(job.params.get("diffusion_model"))
+
+    if os.environ.get("KRAKEN_IDEOGRAM4_PERSISTENT_WORKER") == "1":
+        return _run_with_persistent_worker(job)
+
+    attempts = max(1, int(os.environ.get("KRAKEN_IDEOGRAM4_WORKER_ATTEMPTS", "2") or "2"))
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            label = f"{quant}-attempt-{attempt}" if attempts > 1 else ""
+            return _run_one_shot_worker(job, label=label)
+        except RuntimeError as e:
+            last_error = e
+            if attempt >= attempts or not _is_worker_hard_crash(e):
+                break
+            log.warning("Ideogram worker hard-crashed on attempt %d/%d; retrying", attempt, attempts)
+            _emit_worker_retry(job, f"Ideogram worker crashed during load; retrying ({attempt + 1}/{attempts})")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            time.sleep(3)
+
+    fallback_enabled = os.environ.get("KRAKEN_IDEOGRAM4_FALLBACK_FP8", "0") == "1"
+    if (
+        fallback_enabled
+        and quant == "nf4"
+        and (LOCAL_FP8_REPO / "model_index.json").exists()
+        and last_error is not None
+        and _is_worker_hard_crash(last_error)
+    ):
+        fallback_params = dict(job.params)
+        fallback_params["diffusion_model"] = "Ideogram 4 FP8 (local fallback)"
+        log.warning("Ideogram NF4 worker hard-crashed; falling back to local FP8")
+        _emit_worker_retry(job, "Ideogram NF4 crashed during load; falling back to FP8")
+        return _run_one_shot_worker(job, fallback_params, label="fp8-fallback")
+
+    assert last_error is not None
+    raise last_error

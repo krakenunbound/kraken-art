@@ -23,12 +23,27 @@ import {
 
 const DIM_PRESETS: Array<[string, number, number]> = [
   ["1024 × 1024", 1024, 1024],
+  ["768 × 1152 (portrait)", 768, 1152],
   ["1024 × 1536 (portrait)", 1024, 1536],
   ["1536 × 1024 (landscape)", 1536, 1024],
+  ["1536 × 1536", 1536, 1536],
+  ["1536 × 2048 (portrait)", 1536, 2048],
+  ["2048 × 1536 (landscape)", 2048, 1536],
+  ["2048 × 2048", 2048, 2048],
   ["768 × 768", 768, 768],
   ["512 × 512", 512, 512],
   ["Custom", 0, 0],
 ];
+
+// SDXL/Illustrious are native ~1024 and degrade badly above ~1536, so cap their
+// preset list. Flow-matching models (Krea 2, FLUX, Z-Image) are high-res native
+// and get the full set up to 2048². "Custom" always stays (free width/height).
+function presetsForMode(mode: "checkpoint" | "components"): Array<[string, number, number]> {
+  if (mode === "checkpoint") {
+    return DIM_PRESETS.filter(([name, w, h]) => name === "Custom" || Math.max(w, h) <= 1536);
+  }
+  return DIM_PRESETS;
+}
 
 const SAMPLERS = [
   "dpmpp_2m",
@@ -94,6 +109,8 @@ function defaultSamplingForArch(archId: string, modelName = ""): { cfg: number; 
   switch (archId) {
     case "ideogram4":
       return { cfg: 7.0, steps: 12 };
+    case "krea2":
+      return { cfg: 4.5, steps: 28 }; // Raw base default; Turbo caught by the name check above (cfg 1 / 8 steps)
     case "flux1":
     case "flux2":
       return { cfg: 1.0, steps: 28 }; // KSampler CFG off — same slot as SDXL, value 1
@@ -125,6 +142,7 @@ function detectFromModelName(name: string, models: ModelListing | null): Detecte
   // ---- architecture ----
   if (!out.arch) {
     if (n.includes("ideogram"))                                                        out.arch = "ideogram4";
+    else if (n.includes("krea_2") || n.includes("krea-2") || n.includes("krea2"))      out.arch = "krea2";
     else if (n.includes("flux-2") || n.includes("flux2") || n.includes("flux_2"))      out.arch = "flux2";
     else if (n.includes("flux"))                                                       out.arch = "flux1";
     else if (n.includes("qwen_image") || n.includes("qwen-image") || n.includes("qwenimage"))
@@ -176,6 +194,11 @@ function detectFromModelName(name: string, models: ModelListing | null): Detecte
       if (te) out.textEncoders = [te];
       break;
     }
+    case "krea2": {
+      const vae = pickFirst(vaes, "wan_2.1_vae", "wan2_1_vae", "wan");
+      if (vae) out.vae = vae;
+      break;
+    }
     case "wan": {
       const vae = pickFirst(vaes, "wan_2.1_vae", "wan");
       const te  = pickFirst(tes, "umt5_xxl", "umt5");
@@ -206,6 +229,8 @@ function modelMatchesArch(model: ModelEntry, archId: string): boolean {
       return has("flux-2", "flux2", "flux_2");
     case "ideogram4":
       return has("ideogram", "ideogram-4");
+    case "krea2":
+      return has("krea_2", "krea-2", "krea2", "krea");
     case "qwen_image":
       return has("qwen_image", "qwen-image", "qwenimage", "qwen/");
     case "z_image":
@@ -219,6 +244,16 @@ function modelMatchesArch(model: ModelEntry, archId: string): boolean {
     default:
       return false;
   }
+}
+
+// Ideogram is fully self-contained. Krea keeps bundled text encoders but can use
+// external Qwen/Wan-family VAEs, so its VAE picker stays visible.
+function usesBundledVae(archId: string): boolean {
+  return archId === "ideogram4";
+}
+
+function usesBundledTextEncoders(archId: string): boolean {
+  return archId === "ideogram4" || archId === "krea2";
 }
 
 function modelIsSelectable(model: ModelEntry): boolean {
@@ -246,6 +281,7 @@ const ARCH_PROFILES: ArchProfile[] = [
   { id: "illustrious",  label: "Illustrious (SDXL variant)", mode: "checkpoint", encoders: 0, upscaleAllowed: true,  supported: true },
   { id: "flux1",        label: "FLUX1 (components)",        mode: "components", encoders: 2, upscaleAllowed: true,  supported: true },
   { id: "ideogram4",    label: "Ideogram 4 (open weights)", mode: "components", encoders: 0, upscaleAllowed: true,  supported: true },
+  { id: "krea2",        label: "Krea 2 (open weights)",     mode: "components", encoders: 0, upscaleAllowed: true,  supported: true },
   { id: "flux2",        label: "FLUX2 (components) — Phase 3", mode: "components", encoders: 2, upscaleAllowed: true,  supported: false },
   { id: "z_image",      label: "Z-Image (components)",      mode: "components", encoders: 1, upscaleAllowed: true,  supported: true },
   { id: "qwen_image",   label: "Qwen-Image — Phase 3",      mode: "components", encoders: 1, upscaleAllowed: true,  supported: false },
@@ -336,6 +372,7 @@ export default function Generate({
   const [embToAdd, setEmbToAdd] = useState<string>("");
 
   // ---- prompt + image params ----
+  const [outputName, setOutputName] = useState("");
   const [prompt, setPrompt] = useState("");
   const [negative, setNegative] = useState("");
   const [ideogramMagic, setIdeogramMagic] = useState(true);
@@ -393,6 +430,7 @@ export default function Generate({
   const [upModel, setUpModel] = useState<string>("");
   const [upFactor, setUpFactor] = useState(2.0);
   const [upDenoise, setUpDenoise] = useState(0.35);
+  const [upSteps, setUpSteps] = useState(20);
   const [upTile, setUpTile] = useState(512);
 
   // Auto-pick the first sensible model when the list arrives.
@@ -425,6 +463,7 @@ export default function Generate({
         te: te.length ? [...te] : undefined,
         loras,
         embeddings,
+        outputName: outputName || undefined,
         prompt: prompt || undefined,
         negative: negative || undefined,
         ideogramMagic,
@@ -446,6 +485,7 @@ export default function Generate({
         upModel: upModel || undefined,
         upFactor,
         upDenoise,
+        upSteps,
         upTile,
       };
       // Fire and forget
@@ -512,6 +552,7 @@ export default function Generate({
       didRestore = true;
     }
 
+    if (typeof lg.outputName === "string") { setOutputName(lg.outputName); didRestore = true; }
     if (typeof lg.prompt === "string") { setPrompt(lg.prompt); didRestore = true; }
     if (typeof lg.negative === "string") { setNegative(lg.negative); didRestore = true; }
     if (typeof lg.ideogramMagic === "boolean") { setIdeogramMagic(lg.ideogramMagic); didRestore = true; }
@@ -545,6 +586,7 @@ export default function Generate({
     if (lg.upModel && existsIn("upscale_models", lg.upModel)) { setUpModel(lg.upModel); didRestore = true; }
     if (typeof lg.upFactor === "number") { setUpFactor(lg.upFactor); didRestore = true; }
     if (typeof lg.upDenoise === "number") { setUpDenoise(lg.upDenoise); didRestore = true; }
+    if (typeof lg.upSteps === "number") { setUpSteps(lg.upSteps); didRestore = true; }
     if (typeof lg.upTile === "number") { setUpTile(lg.upTile); didRestore = true; }
 
     // Mark hydration complete even if every saved model disappeared, so fresh
@@ -561,9 +603,9 @@ export default function Generate({
   }, [
     archId, checkpoint, diffusionModel, vae, JSON.stringify(te),
     JSON.stringify(loras), JSON.stringify(embeddings),
-    prompt, negative, ideogramMagic, ideogramMagicMode, ideogramSpeedMode, preset, w, h, steps, cfg, sampler, scheduler, clipSkip,
+    outputName, prompt, negative, ideogramMagic, ideogramMagicMode, ideogramSpeedMode, preset, w, h, steps, cfg, sampler, scheduler, clipSkip,
     count, randomSeed, seed,
-    upEnabled, upMode, upModel, upFactor, upDenoise, upTile,
+    upEnabled, upMode, upModel, upFactor, upDenoise, upSteps, upTile,
   ]);
 
   // Cleanup any pending save timer on unmount
@@ -673,7 +715,7 @@ export default function Generate({
     } else {
       setCheckpoint("");
       setDiffusionModel("");
-      if (nextArch === "ideogram4") setVae("");
+      if (usesBundledVae(nextArch)) setVae("");
     }
   }
 
@@ -717,6 +759,8 @@ export default function Generate({
   const [status, setStatus] = useState<string>("idle");
   const [progressMsg, setProgressMsg] = useState<string>("");
   const [step, setStep] = useState({ step: 0, total: 0 });
+  // Second phase (USDU tile refine) gets its own bar when upscale is on.
+  const [upStep, setUpStep] = useState({ step: 0, total: 0 });
   // Progress timing: genStart is set when a run begins; nowTick ticks every 1s
   // while a job is active so "elapsed" and ETA update live.
   const genStartRef = useRef<number | null>(null);
@@ -826,6 +870,7 @@ export default function Generate({
       const valid = p.embeddings.filter((name) => embeddingsAvail.some((m) => m.name === name));
       setEmbeddings(valid);
     }
+    if (typeof p.output_name === "string") setOutputName(p.output_name);
     setPrompt(p.prompt || "");
     setNegative(p.negative || "");
     if (typeof p.ideogram_magic === "boolean") setIdeogramMagic(p.ideogram_magic);
@@ -951,6 +996,7 @@ export default function Generate({
     genStartRef.current = Date.now();
     setNowTick(Date.now());
     setStep({ step: 0, total: steps });
+    setUpStep({ step: 0, total: 0 });
     setImgIdx({ i: 0, total: count });
     setStatus("submitting");
     setProgressMsg("Submitting");
@@ -959,10 +1005,11 @@ export default function Generate({
       arch: archId,
       checkpoint:      profile.mode === "checkpoint" ? (checkpoint || null) : null,
       diffusion_model: profile.mode === "components" ? (diffusionModel || null) : null,
-      vae: profile.mode === "checkpoint" || archId === "ideogram4" ? null : (vae || null),
-      text_encoders: archId === "ideogram4" ? [] : te.filter(Boolean),
+      vae: profile.mode === "checkpoint" || usesBundledVae(archId) ? null : (vae || null),
+      text_encoders: usesBundledTextEncoders(archId) ? [] : te.filter(Boolean),
       loras,
       embeddings,
+      output_name: outputName.trim() || null,
       prompt:   prompt.trim()   || DEFAULT_PROMPT,
       negative: negative.trim() || DEFAULT_NEGATIVE,
       ideogram_magic: archId === "ideogram4" ? ideogramMagic : false,
@@ -982,6 +1029,7 @@ export default function Generate({
       upscale_model: upEnabled ? (upModel || null) : null,
       upscale_factor: upFactor,
       upscale_denoise: upDenoise,
+      upscale_steps: upSteps,
       upscale_tile_size: upTile,
     };
 
@@ -1005,8 +1053,12 @@ export default function Generate({
           if (evt.status === "succeeded" && evt.result) void appendResultOutputs(evt.result);
         }
         if (evt.type === "progress") {
-          setStep({ step: evt.step, total: evt.total_steps });
-          setImgIdx({ i: evt.image_index, total: evt.total_images });
+          if (evt.phase === "upscale") {
+            setUpStep({ step: evt.step, total: evt.total_steps });
+          } else {
+            setStep({ step: evt.step, total: evt.total_steps });
+            setImgIdx({ i: evt.image_index, total: evt.total_images });
+          }
           if (evt.message) setProgressMsg(evt.message);
         }
         if (evt.type === "image") {
@@ -1050,6 +1102,7 @@ export default function Generate({
   const doneSteps = imgIdx.i * step.total + step.step;
   const totalSteps = imgIdx.total * Math.max(step.total, 1);
   const overallPct = imgIdx.total > 0 ? Math.floor((doneSteps / totalSteps) * 100) : 0;
+  const upPct = upStep.total > 0 ? Math.floor((upStep.step / upStep.total) * 100) : 0;
 
   // Live timing for the progress bar. Rate = completed steps / elapsed; ETA =
   // remaining steps / rate. Only meaningful once at least one step has landed.
@@ -1071,6 +1124,37 @@ export default function Generate({
   const embOptions  = embeddingsAvail.filter((e) => !embeddings.includes(e.name));
   const loraRowOptions = (index: number) =>
     filteredLoras.filter((opt) => opt.name === loras[index]?.name || !loras.some((sel, i) => i !== index && sel.name === opt.name));
+  const kreaRedditModel = pickFirst(selectableDiffusion, "krea2_raw_fp8_scaled", "krea-2-raw", "krea 2 raw", "raw");
+  const kreaRedditVae = pickFirst(vaes, "wan_2.1_vae", "wan2_1_vae", "wan");
+  const kreaRedditTurboLora = pickFirst(lorasAvail, "krea2_turbo_lora_rank_64", "krea2_turbo", "turbo_lora");
+  const kreaRedditBypassLora = pickFirst(lorasAvail, "krea2filterbypass.safetensors", "krea2filterbypass");
+  const kreaRedditMissing = [
+    !kreaRedditModel ? "Raw FP8 model" : "",
+    !kreaRedditVae ? "Wan 2.1 VAE" : "",
+    !kreaRedditTurboLora ? "turbo LoRA" : "",
+    !kreaRedditBypassLora ? "filter bypass LoRA" : "",
+  ].filter(Boolean);
+
+  function applyKreaRedditStack() {
+    if (!kreaRedditModel || !kreaRedditVae || !kreaRedditTurboLora || !kreaRedditBypassLora) return;
+    appliedRecommendationsForRef.current = kreaRedditModel;
+    restoredPrimaryModelRef.current = null;
+    if (archId !== "krea2") setArchId("krea2");
+    setCheckpoint("");
+    setDiffusionModel(kreaRedditModel);
+    setVae(kreaRedditVae);
+    setLoras([
+      { name: kreaRedditTurboLora, weight: 0.6, model_weight: 0.6 },
+      { name: kreaRedditBypassLora, weight: 1.0, model_weight: 1.0 },
+    ]);
+    setPreset("768 × 1152 (portrait)");
+    setW(768);
+    setH(1152);
+    setSteps(12);
+    setCfg(1.0);
+    setSampler("euler");
+    setScheduler("normal");
+  }
 
   return (
     <>
@@ -1191,6 +1275,18 @@ export default function Generate({
           </div>
         )}
 
+        {/* Second bar: USDU tile-refine phase (only once the upscale starts). */}
+        {busy && upEnabled && upStep.total > 0 && (
+          <>
+            <div className="muted small" style={{ marginTop: 4 }}>
+              Upscale ({upMode.toUpperCase()}) · tile {upStep.step}/{upStep.total} · {upPct}%
+            </div>
+            <div className="progress-bar">
+              <div className="progress-bar-fill" style={{ width: `${upPct}%`, background: "linear-gradient(90deg, var(--c-accent), var(--c-accent-2))" }} />
+            </div>
+          </>
+        )}
+
         {errorMsg && <div className="err">{errorMsg}</div>}
 
         {previews.length > 0 && (
@@ -1256,6 +1352,7 @@ export default function Generate({
         {viewerIdx !== null && viewerUrl && previews[viewerIdx] && (
           <ImageViewer
             url={viewerUrl}
+            relPath={previews[viewerIdx].rel_path}
             caption={`${previews[viewerIdx].model_label || previews[viewerIdx].filename} · seed ${previews[viewerIdx].seed || "?"}`}
             onClose={() => setViewerIdx(null)}
             onPrev={viewerIdx > 0 ? () => setViewerIdx(viewerIdx - 1) : undefined}
@@ -1278,6 +1375,17 @@ export default function Generate({
               Backend will reject — pipeline implementation pending.
             </div>
           )}
+        </div>
+
+        <div className="section-title">Output</div>
+        <div className="field">
+          <label>Output name</label>
+          <input
+            type="text"
+            value={outputName}
+            onChange={(e) => setOutputName(e.target.value)}
+            placeholder="optional filename prefix"
+          />
         </div>
 
         <div className="section-title">Model</div>
@@ -1311,11 +1419,27 @@ export default function Generate({
             {selectedPrimaryModel.warning}
           </div>
         )}
+        {archId === "krea2" && (
+          <div className="field">
+            <button
+              onClick={applyKreaRedditStack}
+              disabled={kreaRedditMissing.length > 0}
+              title={kreaRedditMissing.length ? `Missing: ${kreaRedditMissing.join(", ")}` : "Krea 2 Raw FP8 + Wan 2.1 VAE + turbo LoRA 0.6 + bypass LoRA 1.0 + 12 steps + CFG 1"}
+            >
+              Apply Krea Reddit Stack
+            </button>
+            {kreaRedditMissing.length > 0 && (
+              <div className="muted small" style={{ marginTop: 4 }}>
+                Missing: {kreaRedditMissing.join(", ")}
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="field">
-          <label>VAE {profile.mode === "checkpoint" || archId === "ideogram4" ? "(bundled)" : ""}</label>
-          <select value={profile.mode === "checkpoint" || archId === "ideogram4" ? "" : vae} onChange={(e) => setVae(e.target.value)} disabled={profile.mode === "checkpoint" || archId === "ideogram4"}>
-            <option value="">{profile.mode === "checkpoint" || archId === "ideogram4" ? "(bundled)" : "— pick one —"}</option>
+          <label>VAE {profile.mode === "checkpoint" || usesBundledVae(archId) ? "(bundled)" : ""}</label>
+          <select value={profile.mode === "checkpoint" || usesBundledVae(archId) ? "" : vae} onChange={(e) => setVae(e.target.value)} disabled={profile.mode === "checkpoint" || usesBundledVae(archId)}>
+            <option value="">{archId === "krea2" ? "Bundled Qwen VAE" : profile.mode === "checkpoint" || usesBundledVae(archId) ? "(bundled)" : "— pick one —"}</option>
             {vaes.map((v) => <option key={v.name} value={v.name}>{v.name}</option>)}
           </select>
         </div>
@@ -1399,7 +1523,7 @@ export default function Generate({
         <div className="section-title">Dimensions</div>
         <div className="field">
           <select value={preset} onChange={(e) => applyPreset(e.target.value)}>
-            {DIM_PRESETS.map(([n]) => <option key={n} value={n}>{n}</option>)}
+            {presetsForMode(profile.mode).map(([n]) => <option key={n} value={n}>{n}</option>)}
           </select>
         </div>
         <div className="field-row">
@@ -1490,20 +1614,25 @@ export default function Generate({
                   }} />
               </div>
             </div>
-            <div className="field-row">
-              <div className="field">
-                <label>Sampler</label>
-                <select value={sampler} onChange={(e) => setSampler(e.target.value)}>
-                  {SAMPLERS.map((s) => <option key={s} value={s}>{s}</option>)}
-                </select>
+            {/* Sampler/Scheduler only affect SDXL/Illustrious (checkpoint archs).
+                Flow-matching models (FLUX, Z-Image, Krea 2, Ideogram, Wan) use
+                their own fixed scheduler and ignore these, so hide them there. */}
+            {profile.mode === "checkpoint" && (
+              <div className="field-row">
+                <div className="field">
+                  <label>Sampler</label>
+                  <select value={sampler} onChange={(e) => setSampler(e.target.value)}>
+                    {SAMPLERS.map((s) => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                </div>
+                <div className="field">
+                  <label>Scheduler</label>
+                  <select value={scheduler} onChange={(e) => setScheduler(e.target.value)}>
+                    {SCHEDULERS.map((s) => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                </div>
               </div>
-              <div className="field">
-                <label>Scheduler</label>
-                <select value={scheduler} onChange={(e) => setScheduler(e.target.value)}>
-                  {SCHEDULERS.map((s) => <option key={s} value={s}>{s}</option>)}
-                </select>
-              </div>
-            </div>
+            )}
           </>
         )}
 
@@ -1546,7 +1675,13 @@ export default function Generate({
                     <option value="usdu">Ultimate SD Upscale (tile + img2img)</option>
                     <option value="iterative">Iterative (progressive)</option>
                   </select>
-                  <div className="muted small">USDU + Iterative are stubbed; ESRGAN lands first (task #10).</div>
+                  <div className="muted small">
+                    {upMode === "usdu"
+                      ? "Tile + img2img refine with this gen's model (SDXL). Slow, adds detail. Full controls in the Upscale tab."
+                      : upMode === "iterative"
+                      ? "Iterative is still stubbed — falls back to ESRGAN."
+                      : "Fast single-pass upscaler. No diffusion."}
+                  </div>
                 </div>
                 <div className="field">
                   <label>Upscale model</label>
@@ -1570,10 +1705,17 @@ export default function Generate({
                   )}
                 </div>
                 {upMode === "usdu" && (
-                  <div className="field">
-                    <label>Tile size</label>
-                    <input type="number" min={128} max={2048} step={64} value={upTile}
-                      onChange={(e) => setUpTile(parseInt(e.target.value) || 512)} />
+                  <div className="field-row">
+                    <div className="field">
+                      <label>Steps</label>
+                      <input type="number" min={1} max={60} step={1} value={upSteps}
+                        onChange={(e) => setUpSteps(parseInt(e.target.value) || 20)} />
+                    </div>
+                    <div className="field">
+                      <label>Tile size</label>
+                      <input type="number" min={128} max={2048} step={64} value={upTile}
+                        onChange={(e) => setUpTile(parseInt(e.target.value) || 512)} />
+                    </div>
                   </div>
                 )}
               </>

@@ -10,12 +10,19 @@ diffusers>=0.32
 # single_file loader still expects the 4.x layout. Pin until diffusers catches up.
 transformers>=4.46,<5
 accelerate>=1.2
+# Required backend for LoRA loading in diffusers >=0.30. Without it,
+# load_lora_weights / set_adapters raise "PEFT backend is required for this method".
+peft>=0.13,<0.18
 safetensors>=0.4
 sentencepiece
 protobuf
 # FP8 dequant fallback when the GPU cast path isn't available.
 ml_dtypes>=0.5
 einops>=0.8
+# Ideogram 4 NF4 runtime (official ideogram4 package path under external/ideogram4).
+bitsandbytes>=0.49.2
+# Ideogram 4 Q4_K GGUF loader.
+gguf>=0.19
 
 # Image / upscale
 Pillow>=10
@@ -27,6 +34,7 @@ spandrel>=0.4
 fastapi>=0.115
 uvicorn[standard]>=0.32
 websockets>=13
+python-multipart>=0.0.20
 pydantic>=2.9
 python-dotenv
 

@@ -2,6 +2,378 @@
 
 Session-by-session record of what's landed.
 
+## 2026-07-05 — WAN 2.2 T2V/I2V, LoRAs, and last-frame extension
+
+WAN video generation moved from an i2v-only path to a fuller local video
+creation workflow.
+
+What landed:
+- `src/Video.tsx`
+  - T2V/I2V mode switch.
+  - T2V no longer requires an input image.
+  - Explicit high-noise and low-noise expert/LoRA controls.
+  - `Use last frame` action on generated videos for I2V continuation.
+- `python/pipelines/wan_video.py`
+  - Uses `WanPipeline` for T2V and `WanImageToVideoPipeline` for I2V.
+  - Applies the T2V transformer config override (`in_channels=16`) and the T2V
+    boundary ratio (`0.875`).
+  - Keeps I2V image kwargs mode-specific.
+- `python/api/generate.py`
+  - Adds `mode` validation and requires input images only for I2V.
+- `python/api/outputs.py`
+  - Adds `/api/outputs/capture-last-frame`, saving the final decodable frame to
+    `outputs/<date>/frames/`.
+  - Includes an exact-frame fallback for very short clips where `ffmpeg -sseof`
+    returns success without writing a PNG.
+- `src/api/sidecar.ts`
+  - Adds `mode` to video generation params and the last-frame capture helper.
+- `Documentation/WAN_VIDEO.md`
+  - New operator/developer guide for WAN 2.2 model files, LoRAs, extension
+    workflow, and verification baseline.
+
+Model setup:
+- Downloaded the Comfy-Org WAN 2.2 T2V FP8 14B high/low experts into
+  `models/diffusion_models/WAN22/`.
+- Copied the user's WAN 2.2 InterFrame LoRAs into `models/loras/WAN22/`.
+
+Verified:
+- `npm run build`
+- `python\venv\Scripts\python.exe -m py_compile python\api\generate.py python\api\outputs.py python\pipelines\wan_video.py`
+- Real T2V smoke: `outputs/2026-07-05/154131-t2vsmoke.mp4`
+- Captured final frame: `outputs/2026-07-05/frames/154558-lastframe-154131-t2vsmoke.png`
+- Real I2V continuation smoke: `outputs/2026-07-05/154631-i2vexten.mp4`
+
+## 2026-07-05 — Video Up tab: ESRGAN/SeedVR2 upscale, RIFE 60fps, media bins, audio preservation
+
+Video upscaling is now a first-class workflow in Kraken Art. The new **Video
+Up** tab is designed around imported source clips, visible result comparison,
+and practical 2K/4K testing on the local RTX 3090.
+
+What landed:
+- `python/pipelines/video_upscale.py`
+  - ESRGAN/Spandrel frame-upscale path for preservation-first video upscale.
+  - SeedVR2 CLI path for diffusion/detail reconstruction.
+  - RIFE ncnn Vulkan interpolation path for 60fps output.
+  - SeedVR2 **AI detail strength** implemented as a blend between an ESRGAN
+    preservation upscale and the SeedVR2 detail result. This gives the video
+    workflow a practical strength/denoise-like control even though SeedVR2 does
+    not expose an Ultimate-SD-Upscale-style denoise setting.
+  - Final-source-audio muxing: intermediate frame/upscale stages are silent, and
+    the final MP4 can reattach the original source audio stream when **Keep
+    source audio** is enabled.
+- `python/api/video_upscale.py`
+  - `/api/video-upscale` job endpoint with validation for engine, scale mode,
+    fps interpolation mode, SeedVR2 VAE tiling, compile mode, noise scales, and
+    audio preservation.
+- `python/api/outputs.py`
+  - Video import endpoints for file uploads and local path imports.
+  - Latest-video items now include absolute local paths for opening results in
+    external players.
+- `src/VideoUpscale.tsx`
+  - Top **Recent / imported videos** lane for source/before clips.
+  - Bottom **Upscale results** lane for finished `*-vup.mp4` outputs.
+  - Checkbox selection, check-all, delete-checked, delete-all, and per-thumbnail
+    delete in both lanes, without browser confirmation prompts.
+  - Whole-window drag/drop via Tauri native file-drop events plus browser drop
+    fallback.
+  - Side-by-side **Compare preview**: source on the left, result on the right.
+  - Open result in the system player or VLC when the local path is available.
+  - Sliders plus manual number inputs for fps, batch/overlap, SeedVR2 detail
+    strength, input/latent noise, VAE tiling, block swap, ESRGAN tile settings,
+    and related controls.
+- `src/App.tsx`
+  - Global **Open outputs** button in the app chrome, opening the real
+    `outputs/` folder.
+- `src-tauri/tauri.conf.json`
+  - Explicit native file-drop support via `dragDropEnabled: true`.
+- `Documentation/VIDEO_UPSCALE.md`
+  - New operator guide for the feature, recommended presets, audio behavior,
+    output layout, and current test baseline.
+
+Test baseline:
+- Source test clip: Grok Imagine MP4, `1168×768`, ~24fps.
+- ESRGAN/RealESRGAN_x2 1080p60 output was visually preferred by the user over
+  the first SeedVR2 1080p60 test.
+- 2K ESRGAN/RealESRGAN_x2 runs around `1 fps` during frame upscale on the local
+  RTX 3090, before RIFE/encode overhead.
+
+## 2026-05-28 — Video tab: WAN 2.2 i2v A14B pipeline + dedicated UI
+
+Video generation is now a first-class surface, separate from still images. A
+new **▶ Video** tab drives a full WAN 2.2 image-to-video pipeline (the A14B
+dual-expert model), end-to-end from a still frame to an H.264 mp4.
+
+What landed:
+- `python/pipelines/wan_video.py` — full WAN 2.2 i2v pipeline assembled from
+  component files (no diffusers `from_pretrained` download):
+  - **Dual-expert** transformer: high-noise expert for t ≥ boundary, low-noise
+    for t < boundary (`boundary_ratio=0.9`), built into a
+    `WanImageToVideoPipeline`. VRAM: both 14B experts can't co-reside on 24 GB,
+    so we use `enable_model_cpu_offload` (one-time boundary swap of the active
+    expert) rather than FLUX-style per-Linear streaming.
+  - ComfyUI **scaled-fp8** handled on both experts and the UMT5 encoder
+    (`weight = fp8.to(bf16) * scale_weight`); scale keys remapped through the
+    same diffusers rename pass as the weights.
+  - UMT5-XXL text encoder streamed in, used to encode prompt (+ negative when
+    guidance > 1), then freed before sampling.
+  - Frames muxed to mp4 via the system **ffmpeg** (rawvideo pipe → libx264
+    yuv420p, crf 18, +faststart) — zero new Python deps.
+  - Per-step progress events + a final `video` event (mp4 rel_path, seed,
+    first-frame thumbnail).
+- `python/api/generate.py` — `POST /generate/video` (`VideoGenerateRequest`)
+  validates both experts + WAN VAE + UMT5 encoder + input image, then submits
+  `wan_video.run` to the job manager. `outputs.py` already serves/lists mp4.
+- `src/Video.tsx` — new panel: input-frame upload with preview, motion prompt +
+  negative, high/low expert + WAN VAE + UMT5 dropdowns (auto-picked from the
+  scan), lightx2v 4-step LoRA toggle, 480p/720p landscape+portrait presets,
+  frame-count/fps/steps/cfg/seed controls, live progress bar, and an HTML5
+  `<video>` gallery of results.
+- `src/api/sidecar.ts` — `startGenerateVideo` + `VideoGenerateParams`.
+- `src/App.tsx` — `▶ Video` tab wired alongside Image / Library / Music.
+
+Verified end-to-end on the 3090: i2v from a 1024² still → `832×480`, 25 frames,
+4-step lightx2v, ~70 s wall-clock incl. dual-expert load. Output is a valid
+H.264 mp4 (1.56 s clip) served as `video/mp4` over `/api/outputs/file/...`.
+
+Two scaled-FP8 bugs fixed during verification (both surfaced as
+`"mul_cuda" not implemented for 'Float8_e4m3fn'`):
+- **LoRA adapters landed in FP8.** PEFT creates injected `lora_A/lora_B` tensors
+  in the base Linear's dtype; on our FP8 experts that meant the
+  `lora_B(lora_A(x)) * scaling` multiply hit FP8. Fix: `_coerce_lora_dtype`
+  casts every injected LoRA tensor to bf16 after `set_adapters`.
+- **Timestep embedder forced to FP8.** `WanTimeTextImageEmbedding.forward` casts
+  the sinusoidal timestep to `next(time_embedder.parameters()).dtype`; with the
+  embedder kept in FP8, the timestep itself became FP8 and the matmul died.
+  Fix: `_dequantize_fp8_submodule` folds the scale and keeps
+  `condition_embedder` / `patch_embedding` in bf16 — matching diffusers' own
+  `WanTransformer3DModel._skip_layerwise_casting_patterns`.
+
+## 2026-05-28 — Generation metadata embedded in PNG (reuse settings = standard workflow)
+
+"Reuse generation settings" no longer relies on a separate `.settings.json`
+sidecar. Generation metadata is now written *into* the output PNG itself, the
+same way ComfyUI / A1111 do — so Civitai (and any other tool) reads prompt,
+model, steps, seed, cfg, sampler, scheduler and LoRAs straight out of an
+uploaded image, and our own "reuse settings" reads from the very same place.
+
+What landed:
+- `python/pipelines/output_metadata.py` rewritten. Two tEXt chunks are embedded
+  in every generated PNG:
+  - `parameters` — A1111-format text block (prompt, `<lora:name:weight>` inline
+    tags, `Negative prompt:`, then `Steps/Sampler/Schedule type/CFG scale/Seed/
+    Size/Model/Clip skip/Arch`). This is the format Civitai's "generation data"
+    parser recognises.
+  - `kraken_settings` — the full settings JSON (arch, diffusion_model/checkpoint,
+    vae, text_encoders, loras, embeddings, upscale params, etc.), the lossless
+    source for restoring *every* field exactly.
+  - New helpers: `build_settings_dict`, `format_a1111_parameters`,
+    `build_pnginfo`, `save_png_with_metadata`, `read_settings_from_png`.
+- All three pipelines (`flux.py`, `sdxl.py`, `z_image.py`) now save via
+  `save_png_with_metadata(...)` instead of `img.save(...)` + a sidecar write.
+  Upscaled outputs (`-up.png`) carry the embedded metadata too (previously they
+  had no reusable settings at all).
+- `/api/outputs/settings/{path}` reads the embedded `kraken_settings` from the
+  PNG first, falling back to a legacy `.settings.json` sidecar for images made
+  before this change. Same response shape, so the frontend "Reuse generation
+  settings" action is unchanged.
+
+## 2026-05-28 — CivitAI download arch-routing
+
+Downloads via the user's CivitAI API key now auto-sort into architecture
+subfolders instead of dumping everything into the four legacy buckets.
+
+What landed (`python/api/civitai.py`):
+- Replaced the old `_checkpoint_subfolder` (Checkpoint-only,
+  Illustrious/Pony/SDXL/Flux1) with arch-aware routing covering 14
+  architectures via `_ARCH_SUBFOLDER`, applied to **checkpoints, LoRAs, and
+  embeddings** (not just checkpoints).
+- `_detect_arch_from_version` infers arch from a lowercased haystack of
+  `baseModel` + version name + model name, ordered so specific tokens win
+  (illustrious/pony before sdxl, flux2 before flux1, etc.). This mirrors the
+  scanner's path-substring `detected_arch` so a downloaded file lands where the
+  Generate-tab picker expects it.
+- `_route_by_arch` redirects component-architecture checkpoints
+  (flux1/flux2/z_image/qwen_image/chroma/hidream) from `checkpoints/` into
+  `diffusion_models/<Arch>/`, because those pipelines read the transformer from
+  `diffusion_models`. All-in-one checkpoints still work there — the component
+  pipelines tolerate AIO files (flux.py drops `text_encoders.`/`vae.` prefixes;
+  the z_image converter strips `model.diffusion_model.`), so both the split and
+  all-in-one workflows are supported without crippling either.
+- `detected_arch` is now recorded in the download metadata sidecar and returned
+  in the `/api/civitai/download` response.
+
+## 2026-05-28 — Z-Image pipeline (first Phase-3 architecture)
+
+First new image architecture wired end-to-end since FLUX1, continuing the
+"hook up the various models" push. Z-Image is Alibaba Tongyi-Lab's text-to-image
+model; it assembles from three local single-file safetensors (ComfyUI-style)
+rather than an all-in-one checkpoint.
+
+What landed:
+- New `python/pipelines/z_image.py`. Mirrors `flux.py`'s component-assembly
+  approach: meta-device load + LDM/native→diffusers conversion + bf16
+  materialize. The transformer (`ZImageTransformer2DModel`) loads in native
+  Z-Image key layout and is converted via diffusers'
+  `convert_z_image_transformer_checkpoint_to_diffusers` (exact 521/521 key
+  match against the meta-instantiated model). The VAE is the Flux.1-AE
+  (16-channel, scaling 0.3611 / shift 0.1159, no quant convs), loaded with the
+  shared `convert_ldm_vae_checkpoint` path. Architecture configs + tokenizer
+  ship under `python/model_configs/z_image_turbo/` so no gated HF repo is ever
+  touched — only the heavy weights come from the user's local model folders.
+- Text encoding is the Qwen3-4B base model (`Qwen3Model`). The on-disk file
+  carries a `model.` prefix (the ForCausalLM layout); we strip it and load the
+  base encoder. Conditioning is `hidden_states[-2]` after
+  `apply_chat_template(enable_thinking=True)`, masked per-prompt to real token
+  length — a LIST of variable-length tensors as the pipeline expects. The
+  encoder is loaded, used, and freed BEFORE the transformer loads, so peak
+  VRAM is transformer (~11.5 GB) + VAE (~0.3 GB) during sampling instead of
+  also holding the 7.5 GB encoder.
+- Turbo variant runs `guidance_scale=0.0` (no CFG, ~9 steps); the base variant
+  honours the UI CFG and additionally encodes a negative prompt. VRAM placement
+  is full-GPU when it fits (the 24 GB common case) with a `model_cpu_offload`
+  fallback for smaller cards.
+- Backend: `/api/generate` now routes `arch == "z_image"` to `z_image.run`
+  with diffusion_model + VAE + Qwen3 text-encoder validation.
+- Frontend: added a supported `z_image` entry to `ARCH_PROFILES` (components
+  mode, 1 encoder, upscale allowed) and a `modelMatchesArch` case so the
+  architecture→model→LoRA filtering chain works. Scanner already tagged
+  `detected_arch: "z_image"`.
+- Verified end-to-end on the RTX 3090: ZImageTurbo_turbo @ 1024², 9 steps,
+  seed 12345 produced a clean, coherent image (not noise) in ~29 s cold
+  (7.4 s encode + 8 s transformer/VAE load + ~13 s sampling).
+
+## 2026-05-28 — Launcher hygiene, sticky Generate settings, GPU telemetry
+
+Focused cleanup after the FLUX warm-start/audio integration work exposed two
+workflow regressions: launching Kraken Art was starting ACE-Step by default,
+and Generate-tab selections were not reliably surviving app restarts.
+
+What landed:
+- Fixed LoRA loading (B-016). diffusers >=0.30 requires the PEFT backend for
+  `load_lora_weights`/`set_adapters`, but `peft` was never installed and was
+  absent from `requirements.txt`, so every LoRA failed with "PEFT backend is
+  required for this method." Installed `peft` 0.17.1 and pinned
+  `peft>=0.13,<0.18`. Requires a sidecar restart to take effect.
+- `Launch Kraken Art.bat` no longer starts the Kraken_Audio stack by default.
+  Normal launch now starts only the Kraken Art sidecar on `7780` plus the Tauri
+  UI. Integrated audio startup is opt-in via `KRAKEN_LAUNCH_AUDIO=1`, which
+  starts Song Studio and ACE-Step for explicit audio testing.
+- Music tab startup no longer probes Song Studio or ACE-Step automatically.
+  Song Studio catalog loading is behind the explicit "Load Song Studio catalog"
+  button, and ACE health remains behind the explicit "Check ACE" action. This
+  prevents UI navigation from waking ACE or consuming VRAM.
+- Generate tab last-used persistence was repaired and expanded. The UI now
+  saves/restores architecture, model selections, VAE, text encoders, LoRAs,
+  embeddings, prompt fields, dimensions, sampler/scheduler, batch seed/count,
+  and upscale settings through `config/settings.json:lastGenerate`.
+- Settings PATCH now accepts `lastGenerate`. A `config_store.save()` deadlock
+  was fixed by switching the settings lock to `RLock`, so frontend settings
+  saves cannot hang while calling `load()` under the same lock.
+- GPU panel now shows live GPU utilization percent and GPU temperature in
+  Celsius, using the existing NVML path in `/api/gpu`.
+- Generate-tab model selectors are now filtered by selected architecture.
+  Checkpoint architectures like Illustrious no longer get overwritten by an
+  unrelated FLUX selection, and Civitai metadata is used when filenames alone
+  are ambiguous.
+- Civitai checkpoint downloads now route future checkpoint files into
+  architecture subfolders such as `checkpoints/Illustrious` when the model
+  version reports a matching `baseModel`. Download metadata now also stores the
+  model description so recommended settings can be parsed in a follow-up pass.
+- Civitai Library filters now persist between Image/Library tab switches and
+  app restarts. Persisted fields include search text, type, base model, sort,
+  time period, NSFW toggle, page, and cursor state.
+- Added Civitai `period` filtering (`AllTime`, `Year`, `Month`, `Week`, `Day`)
+  so searches like "Highest Rated" can explicitly mean all-time rather than a
+  recent window.
+- Fixed Civitai pagination for current cursor-based API behavior. The backend
+  no longer forwards `page` to Civitai when `query` is present, the frontend
+  tracks `nextCursor`, and the Library displays open-ended pagination as
+  `page N / ...` when Civitai withholds totals.
+- Fixed sparse filtered Civitai result pages. The backend now walks several
+  cursor pages and aggregates matches before returning a Library page, which
+  prevents false "no results" states for searches such as
+  `Peach Blossom` + `Checkpoint` + `Illustrious`.
+- Expanded SDXL/Illustrious sampler and scheduler choices beyond the original
+  small list. The backend maps the added UI names to Diffusers schedulers
+  including Euler, Euler A, Heun, LMS, DDIM, UniPC, DEIS, PNDM, LCM, DPM2,
+  DPM2 A, DPM++ 2M, DPM++ SDE, and DPM++ 2S A variants.
+- LoRA selection is now architecture-filtered. The dropdown uses scanned
+  Civitai metadata and filename/base-model heuristics to show only LoRAs that
+  match the selected architecture, and removes incompatible selected LoRAs when
+  the architecture changes.
+- LoRA selection UI now behaves as row slots instead of a select-plus-button
+  control. Choosing a LoRA immediately adds it to the active list and creates a
+  new empty dropdown below it for adding the next LoRA. The header count now
+  reflects the active rows immediately.
+- LoRA entries now expose per-LoRA model strength in the UI and request payload.
+  Existing saved `weight` values are still accepted; new entries persist both
+  `model_weight` and the legacy `weight` field for compatibility.
+- Added SDXL/Illustrious `clip_skip` support. The Generate panel exposes a
+  `CLIP skip` numeric control near LoRAs (`0` means Diffusers default), and
+  the SDXL pipeline forwards it into `StableDiffusionXLPipeline.__call__`.
+  FLUX ignores this field.
+- Generate and Library tabs are kept mounted and hidden instead of destroyed
+  on tab switches. This preserves in-progress image generation, WebSocket
+  state, gallery thumbnails, and Library filter state while browsing.
+- Generated image outputs now get a sibling `.settings.json` file containing
+  the exact reusable generation settings and per-image seed. Right-clicking a
+  gallery thumbnail opens a `Reuse generation settings` action that restores
+  prompt, model selections, LoRAs, dimensions, sampler/scheduler, seed, and
+  upscale settings. Existing images generated before this change do not have
+  this sidecar metadata.
+- Removed two frontend build blockers in `App.tsx` (`hp` dead state and the
+  unused `setLastSeenLogId` setter) while preserving log polling behavior.
+
+Files touched for this cleanup:
+- `Launch Kraken Art.bat`
+- `python/api/civitai.py`
+- `python/api/gpu.py`
+- `python/api/models.py`
+- `python/api/outputs.py`
+- `python/api/settings.py`
+- `python/config_store.py`
+- `python/pipelines/flux.py`
+- `python/pipelines/output_metadata.py`
+- `python/pipelines/sdxl.py`
+- `src/App.tsx`
+- `src/App.css`
+- `src/Generate.tsx`
+- `src/Library.tsx`
+- `src/Music.tsx`
+- `src/api/sidecar.ts`
+
+Verification:
+- `npm run build` passes.
+- `python\venv\Scripts\python.exe -m py_compile` passes for the changed
+  backend modules touched during this session.
+- `/api/gpu` local check returned live utilization and temperature fields.
+- Settings PATCH schema accepts `lastGenerate`.
+- Settings save path was tested against a temporary settings file.
+- Direct Civitai checks confirmed the new cursor behavior and reproduced the
+  sparse-page case before the backend aggregation fix.
+
+---
+
+## 2026-05-27 — Ecosystem Unification Kickoff (Platform Foundations — PR 1 start)
+
+**Branch:** `feature/ecosystem-unification` (branched from `feature/audio-integration`).
+**Pre-work tag:** `backup/2026-05-27-2123-pre-ecosystem-pr1`
+**Primary undo snapshot:** `backups/2026-05-27-2123-start-ecosystem-unification-pr1/` (full selective source backup)
+**Reference:** `Documentation/design-runs/kraken-unified-ecosystem-architecture-6f9f838e.md` (full approved design after writer/reviewer loop with 0 open issues)
+**Master log:** `Documentation/IMPLEMENTATION-ECOSYSTEM.md` (append-only record of every backup, decision, todo/havedone)
+
+**Context & Motivation:**
+After the complete 2026-05-27 source + documentation audit, the project was assessed as "great progress but chaos barely contained" rather than a smooth ecosystem. The approved design defines the path to a unified Capability/Modality Registry + thin adapters so that images, music, future modalities, manual GUI use, **and** full AI/MCP agent control are first-class peers on the same reliable surface.
+
+**What was done in this session (foundation only — zero behavior change):**
+- Two independent backups created **before any source modification** (filesystem snapshot + new git branch + annotated tag).
+- Running implementation log + todo/havedone discipline established.
+- Strict rule enforced: no functional files touched until backups verified.
+
+This entry marks the official start of the multi-PR unification effort. All subsequent work is documented in `IMPLEMENTATION-ECOSYSTEM.md`.
+
+---
+
 ## 2026-05-23 (night) — Phase D: MP3 export (LAME VBR V0 + embedded cover)
 
 **Branch:** `feature/audio-integration`.

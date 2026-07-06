@@ -11,18 +11,28 @@ import {
   exportSongMp3,
   exportSongsBulk,
   exportedMp3DownloadUrl,
+  generateDialogue,
+  generateSpeech,
+  getAudioEngines,
+  getAudioProviders,
   getAudioJob,
   getPlaylists,
   getSongLibrary,
+  getTtsVoices,
+  localAudioFileUrl,
   openJobWS,
+  type AudioProvider,
+  type AudioEngine,
   type AudioHealth,
   type ModelListing,
   type Playlist,
   type Song,
   type SongStudioHealth,
   type SongStudioModel,
+  type TtsVoice,
   songStreamUrl,
   songStudioHealth,
+  uploadTtsVoice,
 } from "./api/sidecar";
 
 // Filter that's currently active in the left sidebar. `null` = show everything.
@@ -30,6 +40,8 @@ type LibraryFilter =
   | { type: "workspace"; workspaceId: string; workspaceTitle: string }
   | { type: "playlist"; playlistId: string; playlistTitle: string }
   | null;
+
+type AudioWorkflow = "song" | "instrumental" | "sfx" | "speech" | "dialogue";
 
 interface MusicProps {
   models: ModelListing | null;
@@ -60,6 +72,13 @@ function firstAudioPath(song: Song): string | null {
   if (Array.isArray((song as any).audio_paths) && (song as any).audio_paths.length > 0) {
     return (song as any).audio_paths[0];
   }
+  return null;
+}
+
+function resultAudioSrc(result: string | null): string | null {
+  if (!result) return null;
+  if (/^https?:\/\//i.test(result)) return result;
+  if (/^[A-Za-z]:\\/.test(result) || result.startsWith("/")) return localAudioFileUrl(result);
   return null;
 }
 
@@ -108,15 +127,106 @@ export default function Music({ models, sidecar }: MusicProps) {
   const [ssHealth, setSsHealth] = useState<SongStudioHealth | null>(null);
   const [ssModels, setSsModels] = useState<SongStudioModel[]>([]);
 
+  // ---- Audio engine selector (sidecar-managed, lazy) -----------------------
+  // ACE-Step (vocals) vs Stable Audio 3 (instrumental). The picked engine loads
+  // on Generate; the other is killed first. Nothing here loads a model.
+  const [engines, setEngines] = useState<AudioEngine[]>([]);
+  const [engineId, setEngineId] = useState<string>("ace_step");
+  const [workflow, setWorkflow] = useState<AudioWorkflow>("song");
+  const [providers, setProviders] = useState<AudioProvider[]>([]);
+  const selectedEngine = useMemo(() => engines.find((e) => e.id === engineId), [engines, engineId]);
+  const engineChoices = useMemo(() => {
+    return engines.filter((e) => {
+      if (workflow === "song") return e.capability === "song";
+      if (workflow === "instrumental") return e.id === "stable_audio_3";
+      if (workflow === "sfx") return e.capability === "sfx" || e.id === "stable_audio_3";
+      if (workflow === "speech") return e.capability === "speech";
+      if (workflow === "dialogue") return e.id === "tts_luxtts";
+      return true;
+    });
+  }, [engines, workflow]);
+
   // ---- Form state (generation; right pane — unchanged behavior) -----------
   const [prompt, setPrompt] = useState("cinematic space odyssey, vast choirs, pulsing synths, emotional climax");
   const [lyrics, setLyrics] = useState("");
   const [selectedModelId, setSelectedModelId] = useState<string>("");
   const [bpm, setBpm] = useState(128);
   const [duration, setDuration] = useState(75);
+  const [steps, setSteps] = useState(8);
   const [temperature, setTemperature] = useState(0.9);
   const [generateCover, setGenerateCover] = useState(true);
   const [coverPrompt, setCoverPrompt] = useState("");
+  const [ttsVoices, setTtsVoices] = useState<TtsVoice[]>([]);
+  const [ttsVoicesLoading, setTtsVoicesLoading] = useState(false);
+  const [selectedVoiceId, setSelectedVoiceId] = useState("");
+  const [voiceName, setVoiceName] = useState("");
+  const [voiceFile, setVoiceFile] = useState<File | null>(null);
+  const [speechText, setSpeechText] = useState("The tavern fell silent as the door creaked open.");
+  const [dialogueScript, setDialogueScript] = useState("[Narrator] The tavern fell silent as the door creaked open.\n[Guard] Halt! Who goes there?\n[Traveler] Just a weary wanderer, seeking shelter from the storm.");
+  const [speakerMapText, setSpeakerMapText] = useState("Narrator=\nGuard=\nTraveler=");
+  const [ttsSteps, setTtsSteps] = useState(4);
+  const [ttsShift, setTtsShift] = useState(0.5);
+  const [ttsSpeed, setTtsSpeed] = useState(1.0);
+  const [audioLabResult, setAudioLabResult] = useState<string | null>(null);
+
+  const reloadEngines = useCallback(async () => {
+    if (sidecar !== "up") return;
+    try {
+      const data = await getAudioEngines();
+      setEngines(data.engines);
+      // Keep the selection valid; prefer an available engine.
+      setEngineId((cur) => {
+        if (data.engines.some((e) => e.id === cur && e.available)) return cur;
+        return data.engines.find((e) => e.available)?.id ?? cur;
+      });
+    } catch {
+      /* sidecar not ready — selector shows nothing until it is */
+    }
+  }, [sidecar]);
+
+  const reloadProviders = useCallback(async () => {
+    if (sidecar !== "up") return;
+    try {
+      const data = await getAudioProviders();
+      setProviders(data.providers);
+    } catch {
+      setProviders([]);
+    }
+  }, [sidecar]);
+
+  async function loadTtsVoices() {
+    setTtsVoicesLoading(true);
+    try {
+      const data = await getTtsVoices();
+      const voices = [...(data.preset || []), ...(data.custom || [])];
+      setTtsVoices(voices);
+      if (!selectedVoiceId && voices.length > 0) setSelectedVoiceId(voices[0].id);
+    } catch (e: any) {
+      window.alert(`Load voices failed: ${e?.message ?? e}`);
+    } finally {
+      setTtsVoicesLoading(false);
+    }
+  }
+
+  async function onUploadVoice() {
+    if (!voiceFile) {
+      window.alert("Choose a clean reference audio clip first.");
+      return;
+    }
+    const name = voiceName.trim() || voiceFile.name.replace(/\.[^.]+$/, "");
+    setTtsVoicesLoading(true);
+    try {
+      const voice = await uploadTtsVoice(voiceFile, name);
+      setTtsVoices(prev => [...prev, voice]);
+      setSelectedVoiceId(voice.id);
+      setVoiceName("");
+      setVoiceFile(null);
+    } catch (e: any) {
+      window.alert(`Upload voice failed: ${e?.message ?? e}`);
+    } finally {
+      setTtsVoicesLoading(false);
+    }
+  }
 
   // ---- Job / progress state -----------------------------------------------
   const [jobId, setJobId] = useState<string | null>(null);
@@ -155,27 +265,36 @@ export default function Music({ models, sidecar }: MusicProps) {
     }
   }, [sidecar]);
 
-  // Initial load + Song Studio health probe ----------------------------------
+  // Initial load -------------------------------------------------------------
+  // Keep launch-side effects to a minimum: library/playlists come from the
+  // local Kraken sidecar, while Song Studio / ACE probes only happen on
+  // explicit user action or when a generation is actually submitted.
   useEffect(() => {
     if (sidecar !== "up") return;
     reloadLibrary();
     reloadPlaylists();
-    (async () => {
-      try {
-        const h = await songStudioHealth();
-        setSsHealth(h);
-        if (h.ok && h.config?.generationModels) {
-          setSsModels(h.config.generationModels);
-          if (!selectedModelId && h.config.defaultGenerationModel) {
-            setSelectedModelId(h.config.defaultGenerationModel);
-          }
-        }
-      } catch (e: any) {
-        setSsHealth({ ok: false, base_url: "?", error: String(e?.message ?? e) });
-      }
-    })();
+    reloadEngines();
+    reloadProviders();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sidecar]);
+
+  async function loadSongStudioCatalog() {
+    try {
+      const h = await songStudioHealth();
+      setSsHealth(h);
+      if (h.ok && h.config?.generationModels) {
+        setSsModels(h.config.generationModels);
+        if (!selectedModelId && h.config.defaultGenerationModel) {
+          setSelectedModelId(h.config.defaultGenerationModel);
+        }
+      }
+      return h;
+    } catch (e: any) {
+      const err = String(e?.message ?? e);
+      setSsHealth({ ok: false, base_url: "?", error: err });
+      throw e;
+    }
+  }
 
   // ---- Selection helpers ---------------------------------------------------
   const toggleSelected = useCallback((songId: string) => {
@@ -468,6 +587,9 @@ export default function Music({ models, sidecar }: MusicProps) {
   async function checkAce() {
     setAceChecking(true);
     try {
+      if (ssHealth === null) {
+        await loadSongStudioCatalog();
+      }
       const resp = await audioHealth();
       setAceHealth(resp);
     } catch (e: any) {
@@ -477,6 +599,52 @@ export default function Music({ models, sidecar }: MusicProps) {
     }
   }
 
+  function preferredEngine(ids: string[]): string {
+    return ids.find((id) => engines.some((e) => e.id === id && e.available)) || ids[0];
+  }
+
+  function onWorkflowChange(next: AudioWorkflow) {
+    setWorkflow(next);
+    if (next === "song") {
+      setEngineId(preferredEngine(["ace_step", "heartmula"]));
+      setDuration(75);
+    }
+    if (next === "instrumental") {
+      setEngineId("stable_audio_3");
+      setDuration(60);
+      setSteps(8);
+      setGenerateCover(false);
+    }
+    if (next === "sfx") {
+      setEngineId(preferredEngine(["moss_sfx", "stable_audio_3"]));
+      setDuration(5);
+      setSteps(50);
+      setGenerateCover(false);
+    }
+    if (next === "speech") {
+      setEngineId(preferredEngine(["moss_tts", "tts_luxtts"]));
+      setGenerateCover(false);
+    }
+    if (next === "dialogue") {
+      setEngineId("tts_luxtts");
+      setGenerateCover(false);
+    }
+  }
+
+  function parseSpeakerMap(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const raw of speakerMapText.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      const idx = line.indexOf("=");
+      if (idx < 0) continue;
+      const role = line.slice(0, idx).trim();
+      const voice = line.slice(idx + 1).trim();
+      if (role && voice) out[role] = voice;
+    }
+    return out;
+  }
+
   // ---- Generation flow -----------------------------------------------------
   async function submit() {
     if (sidecar !== "up") return;
@@ -484,17 +652,60 @@ export default function Music({ models, sidecar }: MusicProps) {
     setJobId(null);
     setJobStatus(null);
     setProgressMsg("Submitting to orchestrator...");
+    setAudioLabResult(null);
 
     try {
+      if (workflow === "speech") {
+        const provider = engineId === "moss_tts" ? "moss_tts" : "tts_luxtts";
+        if (provider !== "moss_tts" && !selectedVoiceId) throw new Error("Select or upload a voice reference first.");
+        setProgressMsg(provider === "moss_tts" ? "Generating speech with MOSS-TTS..." : "Generating speech with LuxTTS...");
+        const r = await generateSpeech({
+          text: speechText,
+          voice_id: selectedVoiceId,
+          provider,
+          speed: ttsSpeed,
+          num_steps: ttsSteps,
+          t_shift: ttsShift,
+          ref_duration: 5,
+        });
+        setAudioLabResult(r?.result?.audio_url || r?.result?.path || r?.result?.url || JSON.stringify(r.result || r));
+        setProgressMsg("Speech complete.");
+        setBusy(false);
+        reloadEngines();
+        return;
+      }
+
+      if (workflow === "dialogue") {
+        if (engineId !== "tts_luxtts") throw new Error("Multi-voice dialogue is currently wired to LuxTTS voice mapping.");
+        const speakers = parseSpeakerMap();
+        setProgressMsg("Generating multi-voice dialogue with LuxTTS...");
+        const r = await generateDialogue({
+          script: dialogueScript,
+          speakers,
+          speed: ttsSpeed,
+          num_steps: ttsSteps,
+          t_shift: ttsShift,
+          ref_duration: 5,
+          gap_seconds: 0.35,
+        });
+        setAudioLabResult(r?.path || JSON.stringify(r));
+        setProgressMsg(`Dialogue complete (${r?.line_count ?? "?"} lines).`);
+        setBusy(false);
+        reloadEngines();
+        return;
+      }
+
       const payload = {
+        engine_id: engineId,
         prompt,
-        lyrics,
-        ace_model: selectedModelId || null,
+        lyrics: workflow === "song" ? lyrics : "",
+        ace_model: workflow === "song" && engineId === "ace_step" ? (selectedModelId || null) : null,
         bpm,
         key_scale: "C",
         duration,
+        steps,
         temperature,
-        generate_cover: generateCover,
+        generate_cover: workflow === "song" && generateCover,
         cover_prompt: coverPrompt || null,
         thinking: false,
         sample_mode: false,
@@ -513,6 +724,7 @@ export default function Music({ models, sidecar }: MusicProps) {
             setProgressMsg("Complete — refreshing library...");
             setBusy(false);
             await reloadLibrary();
+            reloadEngines();
             return;
           }
           if (snap.error) {
@@ -755,8 +967,7 @@ export default function Music({ models, sidecar }: MusicProps) {
 
         {!libraryError && !libraryLoading && library.length === 0 && (
           <div className="muted" style={{ padding: 30, textAlign: "center" }}>
-            No songs yet. Use the generation form on the right to create one — or check that
-            Song Studio is running on port 8010.
+            No songs yet. Pick an engine and use the generation form on the right to create one.
           </div>
         )}
 
@@ -837,6 +1048,61 @@ export default function Music({ models, sidecar }: MusicProps) {
 
       {/* Right pane — generation form (unchanged behavior, scrollable) ----- */}
       <aside className="pane right-params" style={{ padding: 14, overflowY: "auto" }}>
+        <div className="section-title">Create</div>
+        <div className="field">
+          <select value={workflow} onChange={(e) => onWorkflowChange(e.target.value as AudioWorkflow)} style={{ width: "100%" }}>
+            <option value="song">Music with vocals</option>
+            <option value="instrumental">Instrumental music</option>
+            <option value="sfx">Sound effect / ambience</option>
+            <option value="speech">Text to voice</option>
+            <option value="dialogue">Multi-voice dialogue</option>
+          </select>
+          <div className="muted small" style={{ marginTop: 4 }}>
+            {workflow === "song" && "ACE-Step for local Suno-style songs, including duets when prompted in lyrics/style."}
+            {workflow === "instrumental" && "Stable Audio 3 for instrumental beds and loops."}
+            {workflow === "sfx" && "MOSS-SoundEffect for prompted effects and ambience; Stable Audio remains available as backup."}
+            {workflow === "speech" && "MOSS-TTS for high-quality direct narration, or LuxTTS for reference-voice cloning."}
+            {workflow === "dialogue" && "LuxTTS renders each [Role] line with the mapped voice and stitches the result."}
+          </div>
+        </div>
+
+        {providers.length > 0 && (
+          <div className="field" style={{ display: "grid", gap: 4 }}>
+            {providers.filter(p => p.recommended || !p.installed).slice(0, 7).map((p) => (
+              <div key={p.id} className="muted small">
+                <b style={{ color: p.available ? "var(--c-good)" : "var(--muted)" }}>
+                  {p.available ? "✓" : "○"} {p.label}
+                </b>
+                {" — "}{p.capability}
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="section-title">Engine</div>
+        <div className="field">
+          <select
+            value={engineId}
+            onChange={(e) => setEngineId(e.target.value)}
+            style={{ width: "100%" }}
+            disabled={engines.length === 0}
+          >
+            {engineChoices.length === 0 && <option value="">(loading engines…)</option>}
+            {engineChoices.map((e) => (
+              <option key={e.id} value={e.id} disabled={!e.available}>
+                {e.label}{!e.available ? " — not installed" : ""}{e.running ? " ● loaded" : ""}{e.direct_runner ? " — direct" : ""}
+              </option>
+            ))}
+          </select>
+          <div className="muted small" style={{ marginTop: 4 }}>
+            {selectedEngine?.description ?? "Pick an audio engine."}
+            {selectedEngine && (
+              <> Loads on Generate (~{selectedEngine.vram_hint_gb} GB); resident audio/image models are unloaded first.</>
+            )}
+          </div>
+        </div>
+
+        {workflow === "song" && engineId === "ace_step" && (<>
         <div className="section-title">Song Studio</div>
         <div className="field">
           {ssHealth?.ok ? (
@@ -849,14 +1115,17 @@ export default function Music({ models, sidecar }: MusicProps) {
               )}
             </div>
           ) : (
-            <div style={{ color: "var(--c-bad)", fontSize: 12 }}>
-              Song Studio not reachable at port 8010. Start it via the Kraken_Audio launcher.
-              {ssHealth?.error && <div className="muted small" style={{ marginTop: 4 }}>{ssHealth.error}</div>}
+            <div style={{ color: "var(--muted)", fontSize: 12 }}>
+              The sidecar starts Song Studio automatically when you open the library or
+              load the catalog — no separate launcher needed. First start takes a few seconds.
+              {ssHealth?.error && <div style={{ color: "var(--c-bad)", marginTop: 4 }}>{ssHealth.error}</div>}
             </div>
           )}
         </div>
+        </>)}
 
-        <div className="section-title" style={{ marginTop: 12 }}>Model</div>
+        {workflow === "song" && engineId === "ace_step" && (<>
+        <div className="section-title" style={{ marginTop: 12 }}>ACE-Step model (voice / DiT)</div>
         <div className="field">
           <select
             value={selectedModelId}
@@ -876,24 +1145,88 @@ export default function Music({ models, sidecar }: MusicProps) {
               ? `${ssModels.length} model(s) — live from Song Studio's catalog`
               : `${fsAudioModelCount} filesystem model(s) found; Song Studio not reporting catalog yet`}
           </div>
+          <button onClick={() => { void loadSongStudioCatalog(); }} disabled={sidecar !== "up"} style={{ marginTop: 8, fontSize: 12, width: "100%" }}>
+            {ssModels.length > 0 ? "Refresh Song Studio catalog" : "Load Song Studio catalog"}
+          </button>
         </div>
+        </>)}
 
+        {(workflow === "speech" || workflow === "dialogue") && engineId !== "moss_tts" && (<>
+          <div className="section-title" style={{ marginTop: 12 }}>Voice Library</div>
+          <div className="field">
+            <button onClick={() => { void loadTtsVoices(); }} disabled={ttsVoicesLoading || sidecar !== "up"} style={{ width: "100%", fontSize: 12 }}>
+              {ttsVoicesLoading ? "Loading voices..." : "Load voices / start TTS"}
+            </button>
+            <select
+              value={selectedVoiceId}
+              onChange={(e) => setSelectedVoiceId(e.target.value)}
+              style={{ width: "100%", marginTop: 6 }}
+              disabled={ttsVoices.length === 0}
+            >
+              {ttsVoices.length === 0 && <option value="">No voices loaded</option>}
+              {ttsVoices.map((v) => <option key={v.id} value={v.id}>{v.name || v.id}</option>)}
+            </select>
+            <div style={{ display: "grid", gap: 6, marginTop: 8 }}>
+              <input placeholder="Voice name" value={voiceName} onChange={(e) => setVoiceName(e.target.value)} />
+              <input type="file" accept="audio/*" onChange={(e) => setVoiceFile(e.target.files?.[0] || null)} />
+              <button onClick={() => { void onUploadVoice(); }} disabled={!voiceFile || ttsVoicesLoading} style={{ fontSize: 12 }}>
+                Upload reference voice
+              </button>
+            </div>
+          </div>
+        </>)}
+
+        {(workflow === "song" || workflow === "instrumental" || workflow === "sfx") && (<>
         <div className="section-title" style={{ marginTop: 12 }}>Prompt</div>
         <div className="field">
           <textarea rows={3} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
         </div>
+        </>)}
 
-        <div className="section-title" style={{ marginTop: 8 }}>Lyrics (optional)</div>
-        <div className="field">
-          <textarea
-            rows={5}
-            value={lyrics}
-            onChange={(e) => setLyrics(e.target.value)}
-            placeholder="[Verse 1]&#10;..."
-            style={{ fontFamily: "monospace", fontSize: 12 }}
-          />
-        </div>
+        {(workflow === "instrumental" || workflow === "sfx") ? (
+          <div className="muted small" style={{ marginTop: 2 }}>
+            {workflow === "sfx" && engineId === "moss_sfx"
+              ? "MOSS-SoundEffect is strongest around 1-30 second acoustic descriptions. Use 30-75 steps for quality."
+              : "Stable Audio 3 is instrumental / SFX only. Use descriptive acoustic prompts and short durations for effects."}
+          </div>
+        ) : workflow === "song" ? (<>
+          <div className="section-title" style={{ marginTop: 8 }}>Lyrics (optional)</div>
+          <div className="field">
+            <textarea
+              rows={5}
+              value={lyrics}
+              onChange={(e) => setLyrics(e.target.value)}
+              placeholder="[Verse 1]&#10;..."
+              style={{ fontFamily: "monospace", fontSize: 12 }}
+            />
+          </div>
+        </>) : null}
 
+        {workflow === "speech" && (<>
+          <div className="section-title" style={{ marginTop: 12 }}>Text</div>
+          <div className="field">
+            <textarea rows={7} value={speechText} onChange={(e) => setSpeechText(e.target.value)} />
+          </div>
+        </>)}
+
+        {workflow === "dialogue" && (<>
+          <div className="section-title" style={{ marginTop: 12 }}>Script</div>
+          <div className="field">
+            <textarea rows={8} value={dialogueScript} onChange={(e) => setDialogueScript(e.target.value)} style={{ fontFamily: "monospace", fontSize: 12 }} />
+          </div>
+          <div className="section-title" style={{ marginTop: 8 }}>Voice Map</div>
+          <div className="field">
+            <textarea
+              rows={4}
+              value={speakerMapText}
+              onChange={(e) => setSpeakerMapText(e.target.value)}
+              placeholder={"Narrator=custom_voice_id\nGuard=custom_voice_id"}
+              style={{ fontFamily: "monospace", fontSize: 12 }}
+            />
+          </div>
+        </>)}
+
+        {workflow === "song" && (<>
         <div className="section-title" style={{ marginTop: 12 }}>Album Cover</div>
         <div className="field">
           <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
@@ -913,27 +1246,56 @@ export default function Music({ models, sidecar }: MusicProps) {
             />
           )}
         </div>
+        </>)}
 
         <div className="section-title" style={{ marginTop: 12 }}>Parameters</div>
-        <div className="field-row">
-          <div className="field">
-            <label>BPM</label>
-            <input type="number" value={bpm} onChange={(e) => setBpm(parseInt(e.target.value) || 120)} />
+        {(workflow === "instrumental" || workflow === "sfx") ? (
+          <div className="field-row">
+            <div className="field">
+              <label>Duration (s)</label>
+              <input type="number" value={duration} onChange={(e) => setDuration(parseInt(e.target.value) || 30)} />
+            </div>
+            <div className="field">
+              <label title="Sampling steps for Stable Audio 3">Steps</label>
+              <input type="number" value={steps} onChange={(e) => setSteps(parseInt(e.target.value) || 8)} />
+            </div>
           </div>
-          <div className="field">
-            <label>Duration (s)</label>
-            <input type="number" value={duration} onChange={(e) => setDuration(parseInt(e.target.value) || 60)} />
+        ) : workflow === "song" ? (
+          <div className="field-row">
+            <div className="field">
+              <label>BPM</label>
+              <input type="number" value={bpm} onChange={(e) => setBpm(parseInt(e.target.value) || 120)} />
+            </div>
+            <div className="field">
+              <label>Duration (s)</label>
+              <input type="number" value={duration} onChange={(e) => setDuration(parseInt(e.target.value) || 60)} />
+            </div>
+            <div className="field">
+              <label>Temperature</label>
+              <input
+                type="number"
+                step="0.05"
+                value={temperature}
+                onChange={(e) => setTemperature(parseFloat(e.target.value) || 0.85)}
+              />
+            </div>
           </div>
-          <div className="field">
-            <label>Temperature</label>
-            <input
-              type="number"
-              step="0.05"
-              value={temperature}
-              onChange={(e) => setTemperature(parseFloat(e.target.value) || 0.85)}
-            />
+        ) : (
+          <div className="field-row">
+            <div className="field">
+              <label>Steps</label>
+              <input type="number" value={ttsSteps} onChange={(e) => setTtsSteps(parseInt(e.target.value) || 4)} />
+            </div>
+            <div className="field">
+              <label>Speed</label>
+              <input type="number" step="0.05" value={ttsSpeed} onChange={(e) => setTtsSpeed(parseFloat(e.target.value) || 1)} />
+            </div>
+            <div className="field">
+              <label>T-shift</label>
+              <input type="number" step="0.05" value={ttsShift} onChange={(e) => setTtsShift(parseFloat(e.target.value) || 0.5)} />
+            </div>
           </div>
-        </div>
+        )}
 
         <div className="action-row" style={{ marginTop: 14 }}>
           <button className="primary big" onClick={submit} disabled={busy || sidecar !== "up"}>
@@ -948,6 +1310,22 @@ export default function Music({ models, sidecar }: MusicProps) {
               <b>Job:</b> {jobId.slice(0, 8)}… &nbsp; <b>Status:</b> {jobStatus}
             </div>
             <div className="muted small" style={{ marginTop: 4 }}>{progressMsg}</div>
+          </div>
+        )}
+
+        {!jobId && progressMsg && (
+          <div className="job-status-box" style={{ marginTop: 12 }}>
+            <div className="muted small">{progressMsg}</div>
+            {audioLabResult && (
+              <>
+                {resultAudioSrc(audioLabResult) && (
+                  <audio controls src={resultAudioSrc(audioLabResult) || undefined} style={{ width: "100%", marginTop: 8 }} />
+                )}
+                <div className="muted small" style={{ marginTop: 4, wordBreak: "break-all" }}>
+                  Output: {audioLabResult}
+                </div>
+              </>
+            )}
           </div>
         )}
 

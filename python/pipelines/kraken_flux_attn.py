@@ -71,6 +71,9 @@ log = logging.getLogger("kraken.flux.attn")
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
+_casted_freqs_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
 def apply_rotary_emb_bf16(
     x: torch.Tensor,
     freqs_cis: tuple[torch.Tensor, torch.Tensor],
@@ -88,25 +91,36 @@ def apply_rotary_emb_bf16(
       freqs_cis:   (cos, sin), each [S, D] computed by `FluxPosEmbed`.
       sequence_dim: which dim of x is the sequence — FLUX uses 1.
     """
+    global _casted_freqs_cache
     cos, sin = freqs_cis
-    # Broadcast cos/sin to match x's layout. The diffusers convention:
-    #   sequence_dim=1 → x is [B, S, H, D], cos/sin reshaped to [1, S, 1, D]
-    #   sequence_dim=2 → x is [B, H, S, D], cos/sin reshaped to [1, 1, S, D]
-    if sequence_dim == 1:
-        cos = cos[None, :, None, :]
-        sin = sin[None, :, None, :]
-    elif sequence_dim == 2:
-        cos = cos[None, None, :, :]
-        sin = sin[None, :, None, :]
-    else:
-        raise ValueError(f"sequence_dim must be 1 or 2; got {sequence_dim}")
 
-    # Stay in x's dtype. cos/sin are computed in fp32/fp64 by FluxPosEmbed but
-    # the downstream attention matmul accumulates in fp32 anyway, so the bf16
-    # round-trip here is fine.
-    if cos.dtype != x.dtype:
-        cos = cos.to(dtype=x.dtype)
-        sin = sin.to(dtype=x.dtype)
+    cache_key = (id(cos), id(sin), x.dtype, x.device, sequence_dim)
+    cached = _casted_freqs_cache.get(cache_key)
+    if cached is not None:
+        cos, sin = cached
+    else:
+        # Cast and broadcast cos/sin to match x's layout and device
+        if cos.device != x.device:
+            cos = cos.to(device=x.device, non_blocking=True)
+        if sin.device != x.device:
+            sin = sin.to(device=x.device, non_blocking=True)
+        if cos.dtype != x.dtype:
+            cos = cos.to(dtype=x.dtype)
+        if sin.dtype != x.dtype:
+            sin = sin.to(dtype=x.dtype)
+
+        if sequence_dim == 1:
+            cos = cos[None, :, None, :]
+            sin = sin[None, :, None, :]
+        elif sequence_dim == 2:
+            cos = cos[None, None, :, :]
+            sin = sin[None, :, None, :]
+        else:
+            raise ValueError(f"sequence_dim must be 1 or 2; got {sequence_dim}")
+
+        if len(_casted_freqs_cache) > 10:
+            _casted_freqs_cache.clear()
+        _casted_freqs_cache[cache_key] = (cos, sin)
 
     # x_rotated = stack([-x_imag, x_real], dim=-1).flatten(3)  (FLUX convention)
     # Equivalent: reshape to (..., D/2, 2), swap, negate first, flatten.
@@ -279,11 +293,17 @@ class KrakenFluxAttnProcessor:
             qkv = attn.to_qkv(hidden_states)  # [B, S, 3 * heads * head_dim]
             qkv = qkv.view(B, S_h, 3, attn.heads, -1)
             query, key, value = qkv.unbind(2)  # each [B, S, heads, head_dim]
+            query = query.contiguous()
+            key = key.contiguous()
+            value = value.contiguous()
             if attn.added_kv_proj_dim is not None:
                 S_e = encoder_hidden_states.shape[1]
                 enc_qkv = attn.to_added_qkv(encoder_hidden_states)
                 enc_qkv = enc_qkv.view(B, S_e, 3, attn.heads, -1)
                 enc_q, enc_k, enc_v = enc_qkv.unbind(2)
+                enc_q = enc_q.contiguous()
+                enc_k = enc_k.contiguous()
+                enc_v = enc_v.contiguous()
             else:
                 enc_q = enc_k = enc_v = None
         else:

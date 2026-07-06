@@ -65,7 +65,7 @@ DEFAULTS: dict[str, Any] = {
     "lastGenerate": None,
 }
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 _cache: dict[str, Any] | None = None
 
 

@@ -1,0 +1,3 @@
+# Generated tokenizer payloads required for offline local model assembly.
+# Keep them versioned, but do not render huge JSON/tokenizer diffs in GitHub.
+python/model_configs/**/tokenizer/* -diff linguist-generated=true

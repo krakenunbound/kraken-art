@@ -16,6 +16,12 @@ MODEL_EXTS = {".safetensors", ".sft", ".ckpt", ".pt", ".pth", ".bin", ".gguf"}
 # We do NOT copy the heavy audio models/venvs here. We point at the existing installation.
 DEFAULT_AUDIO_ACE_ROOT = ROOT.parent / "Kraken_Audio" / "ACE-Step-1.5"
 AUDIO_ACE_ROOT = Path(os.environ.get("KRAKEN_AUDIO_ACE_ROOT", str(DEFAULT_AUDIO_ACE_ROOT)))
+DEFAULT_AUDIO_TTS_ROOT = ROOT.parent / "Kraken_Audio" / "VoxtralTTS"
+AUDIO_TTS_ROOT = Path(os.environ.get("KRAKEN_AUDIO_TTS_ROOT", str(DEFAULT_AUDIO_TTS_ROOT)))
+DEFAULT_AUDIO_PROVIDERS_ROOT = ROOT.parent / "Kraken_Audio" / "providers"
+AUDIO_PROVIDERS_ROOT = Path(os.environ.get("KRAKEN_AUDIO_PROVIDERS_ROOT", str(DEFAULT_AUDIO_PROVIDERS_ROOT)))
+DEFAULT_AUDIO_MODELS_ROOT = ROOT.parent / "Kraken_Audio" / "models"
+AUDIO_MODELS_ROOT = Path(os.environ.get("KRAKEN_AUDIO_MODELS_ROOT", str(DEFAULT_AUDIO_MODELS_ROOT)))
 
 # Display name -> folder name(s) under MODELS_ROOT.
 # Multiple folders fold into one category (e.g. text_encoders + clip).

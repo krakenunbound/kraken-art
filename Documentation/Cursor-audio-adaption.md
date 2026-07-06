@@ -1053,3 +1053,42 @@ How to use for testing:
 
 If you want to revert to the old per-port-7780-only behaviour:
   git checkout checkpoint/2026-05-23-2110-pre-launcher-expansion -- "Launch Kraken Art.bat"
+
+---
+
+## 2026-05-27 — Full source audit, bug discovery pass, and snapshot backup (this session)
+
+**Action taken by Grok (non-Cursor):**
+- Read every primary document in `Documentation/` (ARCHITECTURE.md, BUGS.md, CHANGELOG.md, PIPELINES.md, TODO.md, MODELS.md, DEV.md, Cursor-audio-adaption.md, grok_findings.md, FLUX-*.md, README.md variants, codex.md, cursor.md, gemini.md) plus all audio-related source and the full recent CHANGELOG history.
+- Created fresh timestamped source backup: `backups/2026-05-27-1544-full-source-backup/` (selective robocopy of all .py/.tsx/.rs/.json/.md/.bat etc., excluding models/, node_modules/, venv/, target/, outputs/, logs/).
+- Performed deep code review (manual + attempted reviewer subagent) across the audio stack, JobManager, proxies, Music.tsx, orchestrator, mp3_export, clients, and core pipelines.
+- Discovered and documented five new bugs (B-011 through B-015) that were not present in BUGS.md.
+- Updated `Documentation/BUGS.md` with audit header + full entries for the new bugs (symptom / cause / why-fix for each).
+
+**Why this matters for the audio work:**
+- Reinforces the "no surprises" contract that the entire Cursor-audio-adaption.md was written to protect.
+- B-011, B-013 directly affect the cover-art + generation UX that Phase C/D landed.
+- B-012 affects the Phase D MP3 export feature that was the last big commit on this branch.
+- All are now tracked so future work (or a future "polish before release" pass) can address them systematically.
+
+This entry exists so anyone (future Cursor, human, or agent) resuming on `feature/audio-integration` sees exactly what was reviewed and what new debt was found on 2026-05-27.
+
+---
+
+## 2026-05-27 21:23 — Implementation of Ecosystem Unification Begins (Post-Audit)
+
+**Strict user directive followed:** "Do not touch anything until you've backed it up."
+
+**Backups executed before any source modification:**
+- Filesystem snapshot: `backups/2026-05-27-2123-start-ecosystem-unification-pr1/` (comprehensive selective copy)
+- Git: New branch `feature/ecosystem-unification` + annotated tag `backup/2026-05-27-2123-pre-ecosystem-pr1`
+
+**New permanent records created this session:**
+- `Documentation/design-runs/kraken-unified-ecosystem-architecture-6f9f838e.md` — the complete approved design document (after full writer/reviewer/revise loop with 0 open issues)
+- `Documentation/IMPLEMENTATION-ECOSYSTEM.md` — append-only master implementation log containing live todo/havedone, every backup reference, decisions, and rationale (the single source of truth going forward)
+- `Documentation/CHANGELOG.md` — new top-level entry documenting the kickoff
+
+**Work rule in force for the entire unification effort:**
+All changes follow the approved PR plan from the design document. Work begins with pure foundation (PR 1 — Registry + events + VRAMCoordinator skeletons). **Zero behavior change** to existing image or audio functionality is allowed until the foundations are verified.
+
+This note is added to maintain the complete "no surprises" historical contract that this entire document was written to protect. All future detailed implementation notes will live in `IMPLEMENTATION-ECOSYSTEM.md`.

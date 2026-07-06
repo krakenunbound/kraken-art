@@ -17,6 +17,7 @@ The long-running music synthesis itself happens inside the ACE process on its ow
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from dataclasses import dataclass, field
@@ -26,6 +27,8 @@ from typing import Any
 from jobs import Job
 
 from pipelines.audio.ace_client import get_default_ace_client
+from pipelines.audio import engine_manager
+from pipelines.audio import local_providers
 from config import OUTPUTS_ROOT
 
 # We import the image pipelines only when we actually need to generate a cover.
@@ -116,18 +119,157 @@ def _generate_cover(job: Job, cover_prompt: str, width: int = 1024, height: int 
     return None
 
 
-def run(job: Job) -> dict[str, Any]:
-    """The actual worker executed by the central JobManager for kind='audio'."""
-    p = job.params or {}
-    client = get_default_ace_client()
+def _run_stable_audio_3(job: Job, p: dict, spec, cover_path: str | None) -> dict[str, Any]:
+    """Generate instrumental audio via the resident Stable Audio 3 server.
 
-    # 1. Optional album cover using Kraken Art's own image engines
+    The SA3 model stays warm in its process (started by EngineManager.ensure);
+    here we just POST the prompt and collect the WAV it writes into our outputs."""
+    import httpx
+
+    out_dir = _ensure_audio_out_dir()
+    stem = time.strftime("%Y%m%d-%H%M%S") + "-sa3"
+    duration = float(p.get("duration") or 30)
+    steps = int(p.get("steps") or 8)
+    prompt = p.get("prompt", "")
+
+    job.emit({"type": "status", "message": "Generating instrumental with Stable Audio 3…"})
+    payload = {
+        "prompt": prompt,
+        "duration": duration,
+        "steps": steps,
+        "batch_size": 1,
+        "output_dir": str(out_dir),
+        "stem": stem,
+    }
+    try:
+        with httpx.Client(timeout=900.0) as c:
+            r = c.post(spec.base_url.rstrip("/") + "/generate", json=payload)
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        job.emit({"type": "error", "message": f"Stable Audio 3 generation failed: {e}"})
+        raise
+
+    audio_paths = [o.get("path") for o in (data.get("outputs") or []) if o.get("path")]
+    result = {
+        "kind": "audio",
+        "engine": "stable_audio_3",
+        "audio_paths": audio_paths,
+        "cover_path": cover_path,
+        "prompt": prompt,
+        "lyrics": "",
+        "model": data.get("model_id") or "stabilityai/stable-audio-3-medium",
+        "instrumental": True,
+        "duration": duration,
+        "finished_at": time.time(),
+    }
+    job.emit({"type": "audio_complete", "result": result})
+    return result
+
+
+def _prepare_direct_provider(job: Job, engine_id: str) -> None:
+    """Free resident engines before a direct-run provider subprocess loads CUDA."""
+    try:
+        engine_manager.manager.stop_all()
+    except Exception:
+        pass
+    if engine_manager.on_before_engine_start is not None:
+        try:
+            engine_manager.on_before_engine_start(engine_id)
+        except Exception as e:
+            log.warning("direct provider VRAM hook failed: %s", e)
+    job.emit({"type": "status", "message": f"Running direct provider: {engine_id}..."})
+
+
+def _run_moss_sfx(job: Job, p: dict, cover_path: str | None) -> dict[str, Any]:
+    _prepare_direct_provider(job, "moss_sfx")
+    data = local_providers.generate_moss_sfx(
+        prompt=str(p.get("prompt") or ""),
+        duration_s=float(p.get("duration") or 5),
+        steps=int(p.get("steps") or 50),
+    )
+    result = {
+        "kind": "audio",
+        "engine": "moss_sfx",
+        "audio_paths": [data["path"]],
+        "cover_path": cover_path,
+        "prompt": p.get("prompt"),
+        "lyrics": "",
+        "model": "OpenMOSS-Team/MOSS-SoundEffect-v2.0",
+        "instrumental": True,
+        "duration": p.get("duration"),
+        "provider_stats": data,
+        "finished_at": time.time(),
+    }
+    job.emit({"type": "audio_complete", "result": result})
+    return result
+
+
+def _run_heartmula(job: Job, p: dict, cover_path: str | None) -> dict[str, Any]:
+    _prepare_direct_provider(job, "heartmula")
+    data = local_providers.generate_heartmula(
+        prompt=str(p.get("prompt") or ""),
+        lyrics=str(p.get("lyrics") or ""),
+        duration_s=float(p.get("duration") or 30),
+        temperature=float(p.get("temperature") or 1.0),
+    )
+    result = {
+        "kind": "audio",
+        "engine": "heartmula",
+        "audio_paths": [data["path"]],
+        "cover_path": cover_path,
+        "prompt": p.get("prompt"),
+        "lyrics": p.get("lyrics"),
+        "model": "HeartMuLa/HeartMuLa-oss-3B-happy-new-year",
+        "instrumental": False,
+        "duration": p.get("duration"),
+        "provider_stats": data,
+        "finished_at": time.time(),
+    }
+    job.emit({"type": "audio_complete", "result": result})
+    return result
+
+
+def run(job: Job) -> dict[str, Any]:
+    """The actual worker executed by the central JobManager for kind='audio'.
+
+    Routes to the engine the user picked: ACE-Step (vocals/lyrics) or Stable
+    Audio 3 (instrumental/SFX). The sidecar's EngineManager loads the chosen
+    engine on demand and kills the other one first, so only one audio model is
+    ever resident."""
+    p = job.params or {}
+    engine_id = (p.get("engine_id") or "ace_step").strip()
+
+    # 1. Optional album cover using Kraken Art's own image engines. Done BEFORE
+    #    we start the audio engine: the cover load happens on the image side,
+    #    then ensure() unloads it to make room for the audio model.
     cover_path: str | None = None
     if p.get("generate_cover"):
         cover_prompt = p.get("cover_prompt") or p.get("prompt") or "beautiful album artwork"
         cover_path = _generate_cover(job, str(cover_prompt))
 
-    # 2. Build the payload for the real ACE-Step /release_task
+    if engine_id == "moss_sfx":
+        return _run_moss_sfx(job, p, cover_path)
+    if engine_id == "heartmula":
+        return _run_heartmula(job, p, cover_path)
+
+    # 2. Make the picked engine the sole resident audio model. This stops the
+    #    other engine (full VRAM unload) and unloads image/video pipelines via
+    #    the arbiter hook, then starts the engine if it isn't already up.
+    job.emit({"type": "status", "message": f"Loading audio engine: {engine_id}…"})
+    try:
+        spec = engine_manager.manager.ensure(engine_id)
+    except Exception as e:
+        job.emit({"type": "error", "message": f"Could not start audio engine {engine_id!r}: {e}"})
+        raise
+
+    if engine_id == "stable_audio_3":
+        return _run_stable_audio_3(job, p, spec, cover_path)
+
+    # ---- ACE-Step path (vocals + lyrics) ----
+    client = get_default_ace_client()
+
+    # 3. Build the payload for the real ACE-Step /release_task
     # The parser in the finished product accepts a wide range of shapes (form or JSON).
     # We send the important musical fields + the model the user picked from the live list.
     ace_payload: dict[str, Any] = {
@@ -151,13 +293,18 @@ def run(job: Job) -> dict[str, Any]:
 
     job.emit({"type": "status", "message": "Submitting to ACE-Step engine..."})
 
+    # AceClient methods are async; this orchestrator runs in a sync JobManager
+    # worker thread (no running event loop), so we drive each call with
+    # asyncio.run — same pattern as the bulk MP3 export worker.
     try:
-        submit_resp = client.submit_release_task(ace_payload)
+        submit_resp = asyncio.run(client.submit_release_task(ace_payload))
     except Exception as e:
         job.emit({"type": "error", "message": f"Failed to reach ACE API: {e}"})
         raise
 
-    ace_task_id = submit_resp.get("task_id") or submit_resp.get("id")
+    # ACE wraps responses in a {"data": {...}, "code": 200} envelope; unwrap it.
+    submit_data = submit_resp.get("data") if isinstance(submit_resp.get("data"), dict) else submit_resp
+    ace_task_id = submit_data.get("task_id") or submit_data.get("id")
     if not ace_task_id:
         raise RuntimeError(f"ACE did not return a task_id. Response: {submit_resp}")
 
@@ -172,13 +319,14 @@ def run(job: Job) -> dict[str, Any]:
         if job.cancel.is_set():
             # Best-effort: ask ACE to free (it may still be running in background)
             try:
-                client.free_memory()
+                asyncio.run(client.free_memory())
             except Exception:
                 pass
             return {"kind": "audio", "cancelled": True, "ace_task_id": ace_task_id}
 
         try:
-            status = client.get_job_status(ace_task_id)
+            raw_status = asyncio.run(client.get_job_status(ace_task_id))
+            status = raw_status.get("data") if isinstance(raw_status.get("data"), dict) else raw_status
         except Exception as e:
             job.emit({"type": "warning", "message": f"Poll error: {e} — retrying"})
             time.sleep(3)
@@ -216,7 +364,7 @@ def run(job: Job) -> dict[str, Any]:
     # 4. Symmetric VRAM release — tell the finished ACE engine to drop its models
     # so the user can immediately go back to heavy image generation (FLUX etc.).
     try:
-        client.free_memory()
+        asyncio.run(client.free_memory())
         job.emit({"type": "status", "message": "ACE VRAM released — ready for image work"})
     except Exception:
         pass

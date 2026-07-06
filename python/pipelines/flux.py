@@ -9,6 +9,7 @@ VRAM is managed dynamically: `pick_strategy()` compares measured component sizes
 against free VRAM and selects full_gpu, model_cpu_offload, or sequential.
 """
 from __future__ import annotations
+import collections
 import gc
 import io
 import json
@@ -32,6 +33,7 @@ from pipelines.load_utils import (
     stream_safetensors_into_meta,
     unload_pipeline,
 )
+from pipelines.output_metadata import build_output_stem, save_png_with_metadata
 
 log = logging.getLogger("kraken.flux")
 
@@ -93,6 +95,18 @@ def _install_pos_embed_cache() -> None:
 # Install at import time so the patch is in place before any pipe loads.
 # Toggled off for per-step A/B comparison 2026-05-22.
 # _install_pos_embed_cache()
+
+# Install comfy-kitchen's fused apply_rope kernel as a drop-in for diffusers'
+# apply_rotary_emb when the package is available. Apache-2.0 from Comfy-Org —
+# the same kernel ComfyUI uses in their FLUX path. Falls back to diffusers'
+# pure-Python original if comfy-kitchen isn't installed.
+# 2026-05-22: DISABLED while investigating a 12× per-step regression measured
+# in our streaming-partition path. Standalone the kernel is faster (1.49 ms vs
+# 2.84 ms for diffusers) but called from FluxAttnProcessor with VRAM under
+# pressure (~500 MB free during sampling) the gen slows to ~24 s/step. Cause
+# unidentified; see Documentation/FLUX-SPEED-WIP.md for details.
+# from pipelines.kraken_rope import install_ck_rope_patch
+# install_ck_rope_patch()
 
 _OLD_FP8_WEIGHT_SCALE_SUFFIX = ".scale_weight"
 _OLD_FP8_INPUT_SCALE_SUFFIX = ".scale_input"
@@ -472,6 +486,25 @@ def _prepare_flux_transformer_state_dict(
     del raw_state_dict
     gc.collect()
 
+    # All-in-one checkpoints (ComfyUI "checkpoint" layout) bundle the text
+    # encoders and VAE alongside the transformer. Kraken loads those components
+    # separately from their own files, so after the `model.diffusion_model.`
+    # strip these extra keys would otherwise survive into the diffusers
+    # conversion as unexpected keys and corrupt the dtype/partition accounting.
+    # UNet-only checkpoints carry none of these prefixes, so this is a no-op for
+    # the normal FLUX path.
+    _non_transformer_prefixes = ("text_encoders.", "vae.", "first_stage_model.", "conditioner.")
+    n_before = len(state_dict)
+    state_dict = {
+        k: v for k, v in state_dict.items()
+        if not k.startswith(_non_transformer_prefixes)
+    }
+    if len(state_dict) != n_before:
+        log.info(
+            "  dropped %d non-transformer keys from all-in-one checkpoint (loading TE/VAE separately)",
+            n_before - len(state_dict),
+        )
+
     source_weight_scales = _extract_comfy_scaled_fp8_scales(state_dict)
     if source_weight_scales:
         log.info("  preserving %d scaled-FP8 transformer scales for runtime Linear scaling", len(source_weight_scales))
@@ -523,7 +556,9 @@ def unload(*, drop_te: bool = True) -> dict:
     to rebuild the transformer but the next encode call will likely use the
     same text encoders — dropping them would force a wasteful 10 s disk reload.
     """
-    global _pipeline, _pipeline_key, _loaded_loras
+    global _pipeline, _pipeline_key, _loaded_loras, _img2img_pipe, _img2img_for
+    _img2img_pipe = None
+    _img2img_for = None
     had = _pipeline is not None
     n_loras = len(_loaded_loras)
     if _pipeline is not None:
@@ -588,16 +623,33 @@ def _get_tokenizers():
 # then back. Tokenizers are cheap so we cache them too.
 _te_cache: dict[tuple[str, str], dict] = {}
 
+# Conditioning-output cache (the cheap, safe half of "Phase 4"). Caches the
+# small ENCODED tensors — prompt_embeds (~4 MB) + pooled (~3 KB) — NOT the
+# 10 GB encoder weights. This mirrors ComfyUI's CLIPTextEncode node caching:
+# a warm gen with an unchanged prompt + encoders skips the 9.6 GB T5 reload and
+# the encode forward pass entirely. Key includes the encoder paths so swapping
+# encoders invalidates. Bounded to avoid unbounded RAM growth.
+_cond_cache: "collections.OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]]" = (
+    collections.OrderedDict()
+)
+_COND_CACHE_MAX = 16
+
 
 def _drop_te_cache() -> None:
     """Clear the persistent text-encoder cache. Called from `unload()`, from
     the /api/clear_memory endpoint, and on arch switches."""
     global _te_cache
+    cleared_cond = len(_cond_cache)
+    _cond_cache.clear()
     if _te_cache:
         n = len(_te_cache)
         _te_cache.clear()
         gc.collect()
         log.info("dropped %d cached text-encoder set(s) from CPU RAM", n)
+    elif cleared_cond:
+        gc.collect()
+    if cleared_cond:
+        log.info("dropped %d cached conditioning tensor(s)", cleared_cond)
 
 
 def _encode_flux_prompt(
@@ -612,6 +664,19 @@ def _encode_flux_prompt(
     te2_path = _resolve("text_encoders", te2) if te2 else None
     if not te1_path or not te2_path:
         raise ValueError("FLUX requires two text encoders. Slot 1: clip_l.safetensors. Slot 2: t5xxl_fp16.safetensors (or fp8 for less VRAM).")
+
+    # Conditioning-output cache check. On a warm gen with an identical prompt +
+    # encoders we return the previously-encoded tensors and skip the entire
+    # 9.6 GB T5 reload + encode (the single biggest fixed per-gen cost). This is
+    # what gives ComfyUI its big cold->warm drop on a repeated prompt.
+    cache_key = (str(te1_path), str(te2_path), prompt or "", max_sequence_length, str(dtype))
+    cached = _cond_cache.get(cache_key)
+    if cached is not None:
+        _cond_cache.move_to_end(cache_key)
+        log.info("FLUX conditioning cache HIT — skipping text-encoder load + encode")
+        return cached[0], cached[1]
+
+    t_enc = time.time()
 
     # Phase 4 attempt (kept here for future, currently disabled): cache CLIP+T5
     # in CPU RAM between gens. On this hardware it crashed the sidecar via
@@ -668,7 +733,16 @@ def _encode_flux_prompt(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-    log.info("encoded FLUX prompt; text encoders unloaded before transformer load")
+    log.info(
+        "encoded FLUX prompt in %.1fs; text encoders unloaded before transformer load",
+        time.time() - t_enc,
+    )
+
+    _cond_cache[cache_key] = (prompt_embeds, pooled_prompt_embeds)
+    _cond_cache.move_to_end(cache_key)
+    while len(_cond_cache) > _COND_CACHE_MAX:
+        _cond_cache.popitem(last=False)
+
     return prompt_embeds, pooled_prompt_embeds
 
 
@@ -785,13 +859,12 @@ def _ensure_pipeline(diffusion_model: str, vae_name: str | None, te1: str | None
     if n_swapped:
         log.info("  swapped %d Linear modules to StreamingLinear", n_swapped)
 
-    # Patch B (QKV fusion + bf16-native RoPE). Toggled off for per-step bench
-    # comparison 2026-05-22 — keep this block easy to flip with one comment.
-    # from pipelines.kraken_flux_attn import fuse_attention_qkv, install_kraken_attn_processor
-    # n_fused = fuse_attention_qkv(transformer)
-    # install_kraken_attn_processor(transformer)
-    # if n_fused:
-    #     log.info("  fused QKV in %d attention modules + installed bf16-RoPE processor", n_fused)
+    # Patch B (QKV fusion + bf16-native RoPE).
+    from pipelines.kraken_flux_attn import fuse_attention_qkv, install_kraken_attn_processor
+    n_fused = fuse_attention_qkv(transformer)
+    install_kraken_attn_processor(transformer)
+    if n_fused:
+        log.info("  fused QKV in %d attention modules + installed bf16-RoPE processor", n_fused)
 
     gc.collect()
     log.info("  transformer loaded in %.1fs", time.time() - t0)
@@ -976,7 +1049,10 @@ def _ensure_pipeline(diffusion_model: str, vae_name: str | None, te1: str | None
         free_vram_now2 = _free_vram_gb() or 24.0
         # Re-measure after VAE move so the budget is based on what's actually free.
         free_vram_after_vae = _free_vram_gb() or (free_vram_now2 - vae_gb)
-        transformer_budget_gb = max(0.5, free_vram_after_vae - buffer_gb)
+        import sys
+        # On Windows, subtract an additional 1.5 GB to account for WDDM / desktop VRAM paging overhead.
+        windows_margin = 1.5 if sys.platform == "win32" else 0.0
+        transformer_budget_gb = max(0.5, free_vram_after_vae - buffer_gb - windows_margin)
         transformer_budget_bytes = int(transformer_budget_gb * 1024**3)
         log.info(
             "FLUX streaming setup: free VRAM=%.2f GB after VAE · transformer budget=%.2f GB "
@@ -1009,6 +1085,32 @@ def _ensure_pipeline(diffusion_model: str, vae_name: str | None, te1: str | None
     pipe.set_progress_bar_config(disable=True)
     # VAE tiling causes checkerboard garbage on FLUX decode at 512/1024 — skip it.
 
+    # First Block Cache via para-attn. Diffusion residuals between consecutive
+    # sampling steps are typically very similar — when the residual diff is
+    # below `flux_fbcache_threshold`, this skips the bulk of the transformer
+    # forward and reuses the prior step's residual. Published 1.5-2× effective
+    # speedup on FLUX. Threshold default 0.08; lower = more caching = faster
+    # but higher quality risk. Disable with performance.flux_fbcache = "off".
+    # FBCache default flipped to "off" 2026-05-22 after benchmarking — see
+    # config_store comment + Documentation/FLUX-SPEED-WIP.md.
+    fbcache_mode = config_store.get("performance.flux_fbcache", "off")
+    if fbcache_mode == "on":
+        try:
+            # Patch para-attn for diffusers 0.38's two-arg single_transformer_block
+            # API. para-attn 0.3.38 was written against the older signature; without
+            # this patch the cache hits TypeError mid-forward.
+            from pipelines.kraken_fbcache import install_fbcache_patch
+            install_fbcache_patch()
+            from para_attn.first_block_cache.diffusers_adapters.flux import apply_cache_on_pipe
+            threshold = float(config_store.get("performance.flux_fbcache_threshold", 0.08))
+            apply_cache_on_pipe(pipe, residual_diff_threshold=threshold)
+            pipe._kraken_fbcache_threshold = threshold  # type: ignore[attr-defined]
+            log.info("FLUX First Block Cache: enabled (threshold=%.3f)", threshold)
+        except ImportError:
+            log.info("FLUX First Block Cache: para-attn not installed — skipping (pip install para-attn to enable)")
+        except Exception as e:
+            log.warning("FLUX First Block Cache setup failed (%s) — continuing without it", e)
+
     _pipeline = pipe
     _pipeline_key = key
     return pipe
@@ -1018,6 +1120,15 @@ def _ensure_pipeline(diffusion_model: str, vae_name: str | None, te1: str | None
 
 def _adapter_name(lora_name: str) -> str:
     return "lora_" + "".join(ch if ch.isalnum() else "_" for ch in lora_name)[:48]
+
+
+def _lora_model_weight(entry: dict) -> float:
+    value = entry.get("model_weight")
+    if value is None:
+        value = entry.get("weight")
+    if value is None:
+        value = 1.0
+    return float(value)
 
 
 def _apply_loras(pipe, loras: list[dict]) -> None:
@@ -1039,7 +1150,7 @@ def _apply_loras(pipe, loras: list[dict]) -> None:
         adapter = _adapter_name(entry["name"])
         try:
             pipe.load_lora_weights(str(path.parent), weight_name=path.name, adapter_name=adapter)
-            names.append(adapter); weights.append(float(entry.get("weight", 1.0)))
+            names.append(adapter); weights.append(_lora_model_weight(entry))
             log.info("loaded LoRA %s @ %.2f", entry["name"], weights[-1])
         except Exception as e:
             log.warning("failed to load LoRA %s: %s", entry["name"], e)
@@ -1078,6 +1189,11 @@ def _make_callback(job, total_steps: int, image_index: int, total_images: int):
         job.progress.total_steps = total_steps
         job.progress.image_index = image_index
         job.progress.total_images = total_images
+
+        allocated = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0
+        reserved = torch.cuda.memory_reserved() / 1024**3 if torch.cuda.is_available() else 0.0
+        log.info("Step %d progress: PyTorch VRAM allocated=%.2f GB, reserved=%.2f GB", step + 1, allocated, reserved)
+
         job.emit({
             "type": "progress",
             "step": step + 1, "total_steps": total_steps,
@@ -1095,6 +1211,71 @@ def _thumbnail_b64(img: Image.Image, max_side: int = 320) -> str:
     return b64encode(buf.getvalue()).decode("ascii")
 
 
+_img2img_pipe = None
+_img2img_for = None  # id() of the txt2img pipe its components came from
+
+
+def _build_img2img(pipe):
+    """Build/reuse a KrakenFluxImg2ImgPipeline sharing `pipe`'s loaded components.
+
+    Same transformer (StreamingLinear + scaled-FP8 + attn processor), VAE and
+    scheduler — zero extra VRAM. Cached until the underlying transformer changes.
+    """
+    global _img2img_pipe, _img2img_for
+    from pipelines.kraken_flux_pipeline import KrakenFluxImg2ImgPipeline
+
+    if _img2img_pipe is not None and _img2img_for == id(pipe):
+        return _img2img_pipe
+
+    i2i = KrakenFluxImg2ImgPipeline(
+        transformer=pipe.transformer,
+        vae=pipe.vae,
+        text_encoder=None,
+        text_encoder_2=None,
+        tokenizer=None,
+        tokenizer_2=None,
+        scheduler=pipe.scheduler,
+    )
+    i2i._kraken_compute_dtype = getattr(pipe, "_kraken_compute_dtype", None)
+    i2i.set_progress_bar_config(disable=True)
+    _img2img_pipe = i2i
+    _img2img_for = id(pipe)
+    return i2i
+
+
+def make_refiner(pipe, prompt_embeds, pooled_prompt_embeds, *, guidance: float, true_cfg: float = 1.0):
+    """Return a USDU tile-refiner closure for FLUX.
+
+    Standard img2img: VAE-encode the tile, noise to `denoise`, run the same FLUX
+    denoise loop. Reuses the gen's prompt embeds — nothing FLUX-specific, exactly
+    like ComfyUI's KSampler with a checkpoint loader.
+    """
+    i2i = _build_img2img(pipe)
+    offload_strategy = getattr(pipe, "_kraken_offload_strategy", "model_cpu_offload")
+    gen_device = _generator_device(pipe, offload_strategy)
+    exec_device = pipe._execution_device
+    pe = prompt_embeds.to(device=exec_device)
+    ppe = pooled_prompt_embeds.to(device=exec_device)
+
+    def refine(tile: Image.Image, *, steps: int, denoise: float, seed: int) -> Image.Image:
+        gen = torch.Generator(device=gen_device).manual_seed(int(seed) & 0x7FFFFFFF)
+        out = i2i(
+            prompt=None,
+            prompt_embeds=pe,
+            pooled_prompt_embeds=ppe,
+            image=tile,
+            strength=float(denoise),
+            num_inference_steps=int(steps),
+            guidance_scale=guidance,
+            true_cfg_scale=true_cfg,
+            generator=gen,
+            output_type="pil",
+        )
+        return out.images[0]
+
+    return refine
+
+
 def run(job) -> dict:
     from pipelines import sdxl as sdxl_mod
     sdxl_mod.unload()
@@ -1107,14 +1288,21 @@ def run(job) -> dict:
     te2 = te[1] if len(te) >= 2 else None
 
     dtype = _dtype()
+    _t_enc = time.time()
     prompt_embeds_cpu, pooled_prompt_embeds_cpu = _encode_flux_prompt(
         te1,
         te2,
         p.get("prompt", ""),
         dtype=dtype,
     )
+    _enc_s = time.time() - _t_enc
+    _t_setup = time.time()
     pipe = _ensure_pipeline(p["diffusion_model"], p.get("vae"), te1, te2)
     _apply_loras(pipe, p.get("loras") or [])
+    log.info(
+        "FLUX run stages: text-encode=%.1fs · pipeline-ensure+loras=%.1fs (sampling follows)",
+        _enc_s, time.time() - _t_setup,
+    )
 
     width  = int(p.get("width")  or 1024)
     height = int(p.get("height") or 1024)
@@ -1131,7 +1319,7 @@ def run(job) -> dict:
 
     out_dir = OUTPUTS_ROOT / time.strftime("%Y-%m-%d")
     out_dir.mkdir(parents=True, exist_ok=True)
-    base_stem = time.strftime("%H%M%S") + "-" + job.id[:8]
+    base_stem = build_output_stem(p, job.id)
 
     saved: list[dict] = []
     offload_strategy = getattr(pipe, "_kraken_offload_strategy", "model_cpu_offload")
@@ -1161,23 +1349,42 @@ def run(job) -> dict:
 
         fname = f"{base_stem}-{i:02d}.png"
         fpath = out_dir / fname
-        img.save(fpath, format="PNG")
+        save_png_with_metadata(img, fpath, p, int(per_seed))
         entry = {
             "path": str(fpath), "filename": fname, "seed": int(per_seed),
             "width": width, "height": height,
         }
 
-        # Optional upscale
+        # Optional upscale — ESRGAN (fast) or USDU (tile + img2img refine, same model).
         if p.get("upscale_enabled") and p.get("upscale_model"):
+            mode = (p.get("upscale_mode") or "esrgan").lower()
+            factor = float(p.get("upscale_factor", 2.0))
             try:
-                from pipelines import upscale_esrgan
-                up = upscale_esrgan.upscale(img, p["upscale_model"], float(p.get("upscale_factor", 2.0)))
+                if mode == "usdu":
+                    from pipelines import usdu
+                    refiner = make_refiner(
+                        pipe, prompt_embeds, pooled_prompt_embeds,
+                        guidance=embedded_guidance, true_cfg=true_cfg,
+                    )
+                    res = usdu.run_usdu(
+                        img, max(8, round(width * factor)), max(8, round(height * factor)),
+                        upscale_model=p["upscale_model"], refine_fn=refiner,
+                        steps=int(p.get("upscale_steps") or 20),
+                        denoise=float(p.get("upscale_denoise") or 0.2),
+                        seed=int(per_seed),
+                        tile_size=p.get("upscale_tile_size") or None,
+                        progress=usdu.job_progress(job, i, count),
+                    )
+                    up = res["image"]
+                else:
+                    from pipelines import upscale_esrgan
+                    up = upscale_esrgan.upscale(img, p["upscale_model"], factor)
                 up_path = out_dir / f"{base_stem}-{i:02d}-up.png"
-                up.save(up_path, format="PNG")
+                save_png_with_metadata(up, up_path, p, int(per_seed))
                 entry["upscaled_path"] = str(up_path)
                 img = up  # preview the upscaled version
             except Exception as e:
-                log.warning("upscale failed: %s", e)
+                log.warning("upscale (%s) failed: %s", mode, e)
 
         rel_path = fpath.relative_to(OUTPUTS_ROOT).as_posix()
         entry["rel_path"] = rel_path

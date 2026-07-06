@@ -161,10 +161,26 @@ export type AudioEngine = {
   running: boolean;
   instrumental_only: boolean;
   vram_hint_gb: number;
+  capability?: string;
+  direct_runner?: boolean;
 };
 
 export const getAudioEngines = () =>
   getJSON<{ engines: AudioEngine[]; current: string | null }>("/api/audio/engines");
+
+export type AudioProvider = {
+  id: string;
+  capability: string;
+  label: string;
+  available: boolean;
+  installed: boolean;
+  recommended: boolean;
+  notes: string;
+  install_hint?: string | null;
+};
+
+export const getAudioProviders = () =>
+  getJSON<{ providers: AudioProvider[] }>("/api/audio/providers");
 
 export const stopAudioEngines = () =>
   postJSON<{ ok: boolean; current: string | null }>("/api/audio/engines/stop");
@@ -175,6 +191,60 @@ export const cancelAudioJob = (jobId: string) =>
 
 export const audioFileUrl = (absPath: string) =>
   `/api/audio/file?path=${encodeURIComponent(absPath)}`;  // relative to the sidecar — works in Tauri webview
+
+export const localAudioFileUrl = (absPath: string) =>
+  `/api/audio/local-file?path=${encodeURIComponent(absPath)}`;
+
+// ---------- Speech / dialogue ----------
+
+export type TtsVoice = {
+  id: string;
+  name: string;
+  file?: string;
+  ref_text?: string;
+  created?: string;
+};
+
+export const getTtsVoices = () =>
+  getJSON<{ preset: TtsVoice[]; custom: TtsVoice[] }>("/api/audio/tts/voices");
+
+export async function uploadTtsVoice(file: File, name: string, refText = ""): Promise<TtsVoice> {
+  const body = new FormData();
+  body.set("name", name);
+  body.set("ref_text", refText);
+  body.set("audio", file);
+  const path = "/api/audio/tts/voices";
+  const r = await fetch((await base()) + path, { method: "POST", body });
+  if (!r.ok) throw await readError(r, path);
+  return r.json() as Promise<TtsVoice>;
+}
+
+export type SpeechGeneratePayload = {
+  text: string;
+  voice_id: string;
+  provider?: string;
+  speed?: number;
+  num_steps?: number;
+  t_shift?: number;
+  ref_duration?: number;
+};
+
+export const generateSpeech = (payload: SpeechGeneratePayload) =>
+  postJSON<any>("/api/audio/speech/generate", payload);
+
+export type DialogueGeneratePayload = {
+  script: string;
+  speakers: Record<string, string>;
+  provider?: string;
+  speed?: number;
+  num_steps?: number;
+  t_shift?: number;
+  ref_duration?: number;
+  gap_seconds?: number;
+};
+
+export const generateDialogue = (payload: DialogueGeneratePayload) =>
+  postJSON<any>("/api/audio/dialogue/generate", payload);
 
 // ---------- Song Studio (port 8010 — workstation: library, playlists, etc.) ----------
 //
@@ -329,6 +399,7 @@ export type GenerateParams = {
   clip_vision?: string | null;
   loras?: LoraEntry[];
   embeddings?: string[];
+  output_name?: string | null;
   prompt: string;
   negative?: string;
   ideogram_magic?: boolean;
@@ -348,6 +419,7 @@ export type GenerateParams = {
   upscale_model?: string | null;
   upscale_factor?: number;
   upscale_denoise?: number;
+  upscale_steps?: number;
   upscale_tile_size?: number;
 };
 
@@ -362,6 +434,93 @@ export type JobSnapshot = {
 
 export const startGenerate = (p: GenerateParams) =>
   postJSON<{ job_id: string; status: string }>("/api/generate", p);
+
+export type UpscaleParams = {
+  source_rel_path?: string | null;
+  source_path?: string | null;
+  mode: "esrgan" | "usdu";
+  upscale_model?: string | null;
+  size_mode: "factor" | "resolution";
+  factor?: number;
+  target_w?: number | null;
+  target_h?: number | null;
+  refine_arch?: string;
+  refine_checkpoint?: string | null;
+  refine_vae?: string | null;
+  steps?: number;
+  denoise?: number;
+  tile_size?: number | null;
+  cfg?: number;
+  sampler?: string;
+  scheduler?: string;
+  clip_skip?: number | null;
+  prompt?: string;
+  negative?: string;
+  seed?: number;
+  snap_mode?: string;
+  anchor_x?: string;
+  anchor_y?: string;
+};
+export const startUpscale = (p: UpscaleParams) =>
+  postJSON<{ job_id: string; status: string }>("/api/upscale", p);
+
+export type VideoUpscaleStatus = {
+  ffmpeg: string | null;
+  ffprobe: string | null;
+  rife_ncnn: string | null;
+  seedvr2_cli: string | null;
+  seedvr2_python: string | null;
+  seedvr2_model_dir: string;
+  seedvr2_models: { name: string; path: string; size_bytes: number }[];
+  upscale_model_dir: string;
+  upscale_models: { name: string; path: string; size_bytes: number }[];
+};
+
+export type VideoUpscaleParams = {
+  source_rel_path?: string | null;
+  source_path?: string | null;
+  engine: "seedvr2" | "esrgan";
+  dit_model?: string | null;
+  upscale_model?: string | null;
+  scale_mode: "resolution" | "factor";
+  upscale_factor: number;
+  resolution: number;
+  max_resolution: number;
+  batch_size: number;
+  temporal_overlap: number;
+  uniform_batch_size: boolean;
+  chunk_size?: number;
+  color_correction: "lab" | "wavelet" | "wavelet_adaptive" | "hsv" | "adain" | "none";
+  ai_detail_strength: number;
+  input_noise_scale: number;
+  latent_noise_scale: number;
+  ten_bit: boolean;
+  vae_encode_tiled: boolean;
+  vae_encode_tile_size: number;
+  vae_encode_tile_overlap: number;
+  vae_decode_tiled: boolean;
+  vae_decode_tile_size: number;
+  vae_decode_tile_overlap: number;
+  blocks_to_swap: number;
+  swap_io_components: boolean;
+  attention_mode: "sdpa" | "flash_attn_2" | "flash_attn_3" | "sageattn_2" | "sageattn_3";
+  compile_dit: boolean;
+  compile_vae: boolean;
+  compile_mode: "default" | "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs";
+  seed: number;
+  esrgan_tile_size: number;
+  esrgan_tile_overlap: number;
+  keep_audio: boolean;
+  target_fps: number;
+  interpolation: "none" | "rife_ncnn" | "ffmpeg_motion";
+};
+
+export const getVideoUpscaleStatus = () =>
+  getJSON<VideoUpscaleStatus>("/api/video-upscale/status");
+
+export const startVideoUpscale = (p: VideoUpscaleParams) =>
+  postJSON<{ job_id: string; status: string }>("/api/video-upscale", p);
+
 export const getJob = (id: string) => getJSON<JobSnapshot>(`/api/jobs/${id}`);
 export const cancelJob = (id: string) => postJSON<{ status: string }>(`/api/jobs/${id}/cancel`);
 export const ideogramMagicPrompt = (p: {
@@ -388,6 +547,7 @@ export const promptBuilderBuild = (p: {
 
 export type VideoGenerateParams = {
   arch: string;                         // "wan"
+  mode?: "i2v" | "t2v";
   diffusion_model?: string | null;      // high-noise expert
   diffusion_model_2?: string | null;    // low-noise expert
   vae?: string | null;
@@ -467,6 +627,7 @@ export interface LastGenerate {
   te?: string[];
   loras?: LoraEntry[];
   embeddings?: string[];
+  outputName?: string;
   prompt?: string;
   negative?: string;
   ideogramMagic?: boolean;
@@ -488,6 +649,7 @@ export interface LastGenerate {
   upModel?: string;
   upFactor?: number;
   upDenoise?: number;
+  upSteps?: number;
   upTile?: number;
 }
 
@@ -572,6 +734,17 @@ export type LatestImageOutput = {
   height?: number | null;
 };
 
+export type LatestVideoOutput = {
+  rel_path: string;
+  filename: string;
+  path?: string;
+  size_bytes: number;
+  mtime: number;
+};
+
+export type VideoImportResult = { item: LatestVideoOutput };
+export type CaptureVideoFrameResult = { item: LatestImageOutput; source: LatestVideoOutput };
+
 export async function outputFileUrl(relPath: string): Promise<string> {
   return (await base()) + "/api/outputs/file/" + relPath.split("/").map(encodeURIComponent).join("/");
 }
@@ -584,6 +757,26 @@ export const getOutputSettings = (relPath: string) =>
 
 export const getLatestImages = (limit = 9) =>
   getJSON<{ root: string; items: LatestImageOutput[] }>(`/api/outputs/latest-images?limit=${limit}`);
+
+export const getLatestVideos = (limit = 20) =>
+  getJSON<{ root: string; items: LatestVideoOutput[] }>(`/api/outputs/latest-videos?limit=${limit}`);
+
+export async function importVideoFile(file: File): Promise<VideoImportResult> {
+  const path = `/api/outputs/import-video?filename=${encodeURIComponent(file.name)}`;
+  const r = await fetch((await base()) + path, {
+    method: "POST",
+    headers: { "Content-Type": file.type || "application/octet-stream" },
+    body: file,
+  });
+  if (!r.ok) throw await readError(r, path);
+  return r.json() as Promise<VideoImportResult>;
+}
+
+export const importVideoPath = (path: string) =>
+  postJSON<VideoImportResult>("/api/outputs/import-video-path", { path });
+
+export const captureLastVideoFrame = (source_rel_path: string, offset_seconds = 0.12) =>
+  postJSON<CaptureVideoFrameResult>("/api/outputs/capture-last-frame", { source_rel_path, offset_seconds });
 
 export async function openJobWS(jobId: string): Promise<WebSocket> {
   let wsBase: string;
